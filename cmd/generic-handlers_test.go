@@ -25,6 +25,7 @@ import (
 	"testing"
 
 	"github.com/minio/minio/internal/crypto"
+	"github.com/minio/minio/internal/grid"
 	xhttp "github.com/minio/minio/internal/http"
 )
 
@@ -50,9 +51,26 @@ func TestGuessIsRPC(t *testing.T) {
 	r = &http.Request{
 		Proto:  "HTTP/1.1",
 		Method: http.MethodGet,
+		URL:    u,
 	}
-	if guessIsRPCReq(r) {
-		t.Fatal("Test shouldn't report as net/rpc for a non net/rpc request.")
+	if !guessIsRPCReq(r) {
+		t.Fatal("Test shouldn't fail for a possible net/rpc request.")
+	}
+	r = &http.Request{
+		Proto:  "HTTP/1.1",
+		Method: http.MethodGet,
+		URL:    &url.URL{Path: grid.RoutePath},
+	}
+	if !guessIsRPCReq(r) {
+		t.Fatal("Grid RPC path not detected")
+	}
+	r = &http.Request{
+		Proto:  "HTTP/1.1",
+		Method: http.MethodGet,
+		URL:    &url.URL{Path: grid.RouteLockPath},
+	}
+	if !guessIsRPCReq(r) {
+		t.Fatal("Grid RPC path not detected")
 	}
 }
 
@@ -99,15 +117,15 @@ var containsReservedMetadataTests = []struct {
 	},
 	{
 		header:     http.Header{crypto.MetaIV: []string{"iv"}},
-		shouldFail: true,
+		shouldFail: false,
 	},
 	{
 		header:     http.Header{crypto.MetaAlgorithm: []string{crypto.InsecureSealAlgorithm}},
-		shouldFail: true,
+		shouldFail: false,
 	},
 	{
 		header:     http.Header{crypto.MetaSealedKeySSEC: []string{"mac"}},
-		shouldFail: true,
+		shouldFail: false,
 	},
 	{
 		header:     http.Header{ReservedMetadataPrefix + "Key": []string{"value"}},
@@ -155,7 +173,7 @@ func TestSSETLSHandler(t *testing.T) {
 		r.Header = test.Header
 		r.URL = test.URL
 
-		h := setRequestValidityHandler(okHandler)
+		h := setRequestValidityMiddleware(okHandler)
 		h.ServeHTTP(w, r)
 
 		switch {

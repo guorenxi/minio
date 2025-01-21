@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -29,11 +29,13 @@ import (
 	"net/http"
 	"path"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
+	"unsafe"
 
 	"github.com/google/uuid"
 	"github.com/klauspost/compress/s2"
@@ -46,9 +48,11 @@ import (
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/ioutil"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/trie"
-	"github.com/minio/pkg/wildcard"
+	"github.com/minio/pkg/v3/trie"
+	"github.com/minio/pkg/v3/wildcard"
+	"github.com/valyala/bytebufferpool"
 )
 
 const (
@@ -62,6 +66,7 @@ const (
 	minioMetaTmpBucket = minioMetaBucket + "/tmp"
 	// MinIO tmp meta prefix for deleted objects.
 	minioMetaTmpDeletedBucket = minioMetaTmpBucket + "/.trash"
+
 	// DNS separator (period), used for bucket name validation.
 	dnsDelimiter = "."
 	// On compressed files bigger than this;
@@ -70,7 +75,23 @@ const (
 	compReadAheadBuffers = 5
 	// Size of each buffer.
 	compReadAheadBufSize = 1 << 20
+	// Pad Encrypted+Compressed files to a multiple of this.
+	compPadEncrypted = 256
+	// Disable compressed file indices below this size
+	compMinIndexSize = 8 << 20
 )
+
+// getkeyeparator - returns the separator to be used for
+// persisting on drive.
+//
+// - ":" is used on non-windows platforms
+// - "_" is used on windows platforms
+func getKeySeparator() string {
+	if runtime.GOOS == globalWindowsOSName {
+		return "_"
+	}
+	return ":"
+}
 
 // isMinioBucket returns true if given bucket is a MinIO internal
 // bucket and false otherwise.
@@ -166,7 +187,11 @@ func IsValidObjectPrefix(object string) bool {
 	if strings.Contains(object, `//`) {
 		return false
 	}
-	return true
+	// This is valid for AWS S3 but it will never
+	// work with file systems, we will reject here
+	// to return object name invalid rather than
+	// a cryptic error from the file system.
+	return !strings.ContainsRune(object, 0)
 }
 
 // checkObjectNameForLengthAndSlash -check for the validity of object name length and prefis as slash
@@ -188,7 +213,7 @@ func checkObjectNameForLengthAndSlash(bucket, object string) error {
 	if runtime.GOOS == globalWindowsOSName {
 		// Explicitly disallowed characters on windows.
 		// Avoids most problematic names.
-		if strings.ContainsAny(object, `:*?"|<>`) {
+		if strings.ContainsAny(object, `\:*?"|<>`) {
 			return ObjectNameInvalid{
 				Bucket: bucket,
 				Object: object,
@@ -200,6 +225,9 @@ func checkObjectNameForLengthAndSlash(bucket, object string) error {
 
 // SlashSeparator - slash separator.
 const SlashSeparator = "/"
+
+// SlashSeparatorChar - slash separator.
+const SlashSeparatorChar = '/'
 
 // retainSlash - retains slash from a path.
 func retainSlash(s string) string {
@@ -219,15 +247,122 @@ func pathsJoinPrefix(prefix string, elem ...string) (paths []string) {
 	return paths
 }
 
+// string concat alternative to s1 + s2 with low overhead.
+func concat(ss ...string) string {
+	length := len(ss)
+	if length == 0 {
+		return ""
+	}
+	// create & allocate the memory in advance.
+	n := 0
+	for i := 0; i < length; i++ {
+		n += len(ss[i])
+	}
+	b := make([]byte, 0, n)
+	for i := 0; i < length; i++ {
+		b = append(b, ss[i]...)
+	}
+	return unsafe.String(unsafe.SliceData(b), n)
+}
+
 // pathJoin - like path.Join() but retains trailing SlashSeparator of the last element
 func pathJoin(elem ...string) string {
-	trailingSlash := ""
-	if len(elem) > 0 {
-		if HasSuffix(elem[len(elem)-1], SlashSeparator) {
-			trailingSlash = SlashSeparator
+	sb := bytebufferpool.Get()
+	defer func() {
+		sb.Reset()
+		bytebufferpool.Put(sb)
+	}()
+
+	return pathJoinBuf(sb, elem...)
+}
+
+// pathJoinBuf - like path.Join() but retains trailing SlashSeparator of the last element.
+// Provide a string builder to reduce allocation.
+func pathJoinBuf(dst *bytebufferpool.ByteBuffer, elem ...string) string {
+	trailingSlash := len(elem) > 0 && hasSuffixByte(elem[len(elem)-1], SlashSeparatorChar)
+	dst.Reset()
+	added := 0
+	for _, e := range elem {
+		if added > 0 || e != "" {
+			if added > 0 {
+				dst.WriteByte(SlashSeparatorChar)
+			}
+			dst.WriteString(e)
+			added += len(e)
 		}
 	}
-	return path.Join(elem...) + trailingSlash
+
+	if pathNeedsClean(dst.Bytes()) {
+		s := path.Clean(dst.String())
+		if trailingSlash {
+			return s + SlashSeparator
+		}
+		return s
+	}
+	if trailingSlash {
+		dst.WriteByte(SlashSeparatorChar)
+	}
+	return dst.String()
+}
+
+// hasSuffixByte returns true if the last byte of s is 'suffix'
+func hasSuffixByte(s string, suffix byte) bool {
+	return len(s) > 0 && s[len(s)-1] == suffix
+}
+
+// pathNeedsClean returns whether path.Clean may change the path.
+// Will detect all cases that will be cleaned,
+// but may produce false positives on non-trivial paths.
+func pathNeedsClean(path []byte) bool {
+	if len(path) == 0 {
+		return true
+	}
+
+	rooted := path[0] == '/'
+	n := len(path)
+
+	r, w := 0, 0
+	if rooted {
+		r, w = 1, 1
+	}
+
+	for r < n {
+		switch {
+		case path[r] > 127:
+			// Non ascii.
+			return true
+		case path[r] == '/':
+			// multiple / elements
+			return true
+		case path[r] == '.' && (r+1 == n || path[r+1] == '/'):
+			// . element - assume it has to be cleaned.
+			return true
+		case path[r] == '.' && path[r+1] == '.' && (r+2 == n || path[r+2] == '/'):
+			// .. element: remove to last / - assume it has to be cleaned.
+			return true
+		default:
+			// real path element.
+			// add slash if needed
+			if rooted && w != 1 || !rooted && w != 0 {
+				w++
+			}
+			// copy element
+			for ; r < n && path[r] != '/'; r++ {
+				w++
+			}
+			// allow one slash, not at end
+			if r < n-1 && path[r] == '/' {
+				r++
+			}
+		}
+	}
+
+	// Turn empty string into "."
+	if w == 0 {
+		return true
+	}
+
+	return false
 }
 
 // mustGetUUID - get a random UUID.
@@ -238,6 +373,15 @@ func mustGetUUID() string {
 	}
 
 	return u.String()
+}
+
+// mustGetUUIDBytes - get a random UUID as 16 bytes unencoded.
+func mustGetUUIDBytes() []byte {
+	u, err := uuid.NewRandom()
+	if err != nil {
+		logger.CriticalIf(GlobalContext, err)
+	}
+	return u[:]
 }
 
 // Create an s3 compatible MD5sum for complete multipart transaction.
@@ -277,7 +421,7 @@ func removeStandardStorageClass(metadata map[string]string) map[string]string {
 func cleanMetadataKeys(metadata map[string]string, keyNames ...string) map[string]string {
 	newMeta := make(map[string]string, len(metadata))
 	for k, v := range metadata {
-		if contains(keyNames, k) {
+		if slices.Contains(keyNames, k) {
 			continue
 		}
 		newMeta[k] = v
@@ -301,7 +445,7 @@ func extractETag(metadata map[string]string) string {
 // to do case insensitive checks.
 func HasPrefix(s string, prefix string) bool {
 	if runtime.GOOS == globalWindowsOSName {
-		return strings.HasPrefix(strings.ToLower(s), strings.ToLower(prefix))
+		return stringsHasPrefixFold(s, prefix)
 	}
 	return strings.HasPrefix(s, prefix)
 }
@@ -386,13 +530,13 @@ func getHostFromSrv(records []dns.SrvRecord) (host string) {
 }
 
 // IsCompressed returns true if the object is marked as compressed.
-func (o ObjectInfo) IsCompressed() bool {
+func (o *ObjectInfo) IsCompressed() bool {
 	_, ok := o.UserDefined[ReservedMetadataPrefix+"compression"]
 	return ok
 }
 
 // IsCompressedOK returns whether the object is compressed and can be decompressed.
-func (o ObjectInfo) IsCompressedOK() (bool, error) {
+func (o *ObjectInfo) IsCompressedOK() (bool, error) {
 	scheme, ok := o.UserDefined[ReservedMetadataPrefix+"compression"]
 	if !ok {
 		return false, nil
@@ -404,32 +548,47 @@ func (o ObjectInfo) IsCompressedOK() (bool, error) {
 	return true, fmt.Errorf("unknown compression scheme: %s", scheme)
 }
 
-// GetActualETag - returns the actual etag of the stored object
-// decrypts SSE objects.
-func (o ObjectInfo) GetActualETag(h http.Header) string {
-	if _, ok := crypto.IsEncrypted(o.UserDefined); !ok {
-		return o.ETag
-	}
-	return getDecryptedETag(h, o, false)
-}
-
 // GetActualSize - returns the actual size of the stored object
 func (o ObjectInfo) GetActualSize() (int64, error) {
+	if o.ActualSize != nil {
+		return *o.ActualSize, nil
+	}
 	if o.IsCompressed() {
-		sizeStr, ok := o.UserDefined[ReservedMetadataPrefix+"actual-size"]
-		if !ok {
+		sizeStr := o.UserDefined[ReservedMetadataPrefix+"actual-size"]
+		if sizeStr != "" {
+			size, err := strconv.ParseInt(sizeStr, 10, 64)
+			if err != nil {
+				return -1, errInvalidDecompressedSize
+			}
+			return size, nil
+		}
+		var actualSize int64
+		for _, part := range o.Parts {
+			actualSize += part.ActualSize
+		}
+		if (actualSize == 0) && (actualSize != o.Size) {
 			return -1, errInvalidDecompressedSize
 		}
-		size, err := strconv.ParseInt(sizeStr, 10, 64)
-		if err != nil {
-			return -1, errInvalidDecompressedSize
-		}
-		return size, nil
+		return actualSize, nil
 	}
 	if _, ok := crypto.IsEncrypted(o.UserDefined); ok {
-		return o.DecryptedSize()
+		sizeStr := o.UserDefined[ReservedMetadataPrefix+"actual-size"]
+		if sizeStr != "" {
+			size, err := strconv.ParseInt(sizeStr, 10, 64)
+			if err != nil {
+				return -1, errObjectTampered
+			}
+			return size, nil
+		}
+		actualSize, err := o.DecryptedSize()
+		if err != nil {
+			return -1, err
+		}
+		if (actualSize == 0) && (actualSize != o.Size) {
+			return -1, errObjectTampered
+		}
+		return actualSize, nil
 	}
-
 	return o.Size, nil
 }
 
@@ -441,11 +600,7 @@ func isCompressible(header http.Header, object string) bool {
 	cfg := globalCompressConfig
 	globalCompressConfigMu.Unlock()
 
-	_, ok := crypto.IsRequested(header)
-	if !cfg.Enabled || (ok && !cfg.AllowEncrypted) || excludeForCompression(header, object, cfg) {
-		return false
-	}
-	return true
+	return !excludeForCompression(header, object, cfg)
 }
 
 // Eliminate the non-compressible objects.
@@ -456,28 +611,45 @@ func excludeForCompression(header http.Header, object string, cfg compress.Confi
 		return true
 	}
 
+	if crypto.Requested(header) && !cfg.AllowEncrypted {
+		return true
+	}
+
 	// We strictly disable compression for standard extensions/content-types (`compressed`).
 	if hasStringSuffixInSlice(objStr, standardExcludeCompressExtensions) || hasPattern(standardExcludeCompressContentTypes, contentType) {
 		return true
 	}
 
 	// Filter compression includes.
-	exclude := len(cfg.Extensions) > 0 || len(cfg.MimeTypes) > 0
+	if len(cfg.Extensions) == 0 && len(cfg.MimeTypes) == 0 {
+		// Nothing to filter, include everything.
+		return false
+	}
+
 	if len(cfg.Extensions) > 0 && hasStringSuffixInSlice(objStr, cfg.Extensions) {
-		exclude = false
+		// Matched an extension to compress, do not exclude.
+		return false
 	}
 
 	if len(cfg.MimeTypes) > 0 && hasPattern(cfg.MimeTypes, contentType) {
-		exclude = false
+		// Matched an MIME type to compress, do not exclude.
+		return false
 	}
-	return exclude
+
+	// Did not match any inclusion filters, exclude from compression.
+	return true
 }
 
 // Utility which returns if a string is present in the list.
-// Comparison is case insensitive.
+// Comparison is case insensitive. Explicit short-circuit if
+// the list contains the wildcard "*".
 func hasStringSuffixInSlice(str string, list []string) bool {
 	str = strings.ToLower(str)
 	for _, v := range list {
+		if v == "*" {
+			return true
+		}
+
 		if strings.HasSuffix(str, strings.ToLower(v)) {
 			return true
 		}
@@ -522,24 +694,66 @@ func partNumberToRangeSpec(oi ObjectInfo, partNumber int) *HTTPRangeSpec {
 // Returns the compressed offset which should be skipped.
 // If encrypted offsets are adjusted for encrypted block headers/trailers.
 // Since de-compression is after decryption encryption overhead is only added to compressedOffset.
-func getCompressedOffsets(objectInfo ObjectInfo, offset int64) (compressedOffset int64, partSkip int64, firstPart int) {
+func getCompressedOffsets(oi ObjectInfo, offset int64, decrypt func([]byte) ([]byte, error)) (compressedOffset int64, partSkip int64, firstPart int, decryptSkip int64, seqNum uint32) {
 	var skipLength int64
 	var cumulativeActualSize int64
 	var firstPartIdx int
-	if len(objectInfo.Parts) > 0 {
-		for i, part := range objectInfo.Parts {
-			cumulativeActualSize += part.ActualSize
-			if cumulativeActualSize <= offset {
-				compressedOffset += part.Size
-			} else {
-				firstPartIdx = i
-				skipLength = cumulativeActualSize - part.ActualSize
-				break
+	for i, part := range oi.Parts {
+		cumulativeActualSize += part.ActualSize
+		if cumulativeActualSize <= offset {
+			compressedOffset += part.Size
+		} else {
+			firstPartIdx = i
+			skipLength = cumulativeActualSize - part.ActualSize
+			break
+		}
+	}
+	partSkip = offset - skipLength
+
+	// Load index and skip more if feasible.
+	if partSkip > 0 && len(oi.Parts) > firstPartIdx && len(oi.Parts[firstPartIdx].Index) > 0 {
+		_, isEncrypted := crypto.IsEncrypted(oi.UserDefined)
+		if isEncrypted {
+			dec, err := decrypt(oi.Parts[firstPartIdx].Index)
+			if err == nil {
+				// Load Index
+				var idx s2.Index
+				_, err := idx.Load(s2.RestoreIndexHeaders(dec))
+
+				// Find compressed/uncompressed offsets of our partskip
+				compOff, uCompOff, err2 := idx.Find(partSkip)
+
+				if err == nil && err2 == nil && compOff > 0 {
+					// Encrypted.
+					const sseDAREEncPackageBlockSize = SSEDAREPackageBlockSize + SSEDAREPackageMetaSize
+					// Number of full blocks in skipped area
+					seqNum = uint32(compOff / SSEDAREPackageBlockSize)
+					// Skip this many inside a decrypted block to get to compression block start
+					decryptSkip = compOff % SSEDAREPackageBlockSize
+					// Skip this number of full blocks.
+					skipEnc := compOff / SSEDAREPackageBlockSize
+					skipEnc *= sseDAREEncPackageBlockSize
+					compressedOffset += skipEnc
+					// Skip this number of uncompressed bytes.
+					partSkip -= uCompOff
+				}
+			}
+		} else {
+			// Not encrypted
+			var idx s2.Index
+			_, err := idx.Load(s2.RestoreIndexHeaders(oi.Parts[firstPartIdx].Index))
+
+			// Find compressed/uncompressed offsets of our partskip
+			compOff, uCompOff, err2 := idx.Find(partSkip)
+
+			if err == nil && err2 == nil && compOff > 0 {
+				compressedOffset += compOff
+				partSkip -= uCompOff
 			}
 		}
 	}
 
-	return compressedOffset, offset - skipLength, firstPartIdx
+	return compressedOffset, partSkip, firstPartIdx, decryptSkip, seqNum
 }
 
 // GetObjectReader is a type that wraps a reader with a lock to
@@ -548,7 +762,6 @@ type GetObjectReader struct {
 	io.Reader
 	ObjInfo    ObjectInfo
 	cleanUpFns []func()
-	opts       ObjectOptions
 	once       sync.Once
 }
 
@@ -573,7 +786,6 @@ func NewGetObjectReaderFromReader(r io.Reader, oi ObjectInfo, opts ObjectOptions
 		ObjInfo:    oi,
 		Reader:     r,
 		cleanUpFns: cleanupFns,
-		opts:       opts,
 	}, nil
 }
 
@@ -587,7 +799,7 @@ type ObjReaderFn func(inputReader io.Reader, h http.Header, cleanupFns ...func()
 // are called on Close() in FIFO order as passed in ObjReadFn(). NOTE: It is
 // assumed that clean up functions do not panic (otherwise, they may
 // not all run!).
-func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
+func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions, h http.Header) (
 	fn ObjReaderFn, off, length int64, err error,
 ) {
 	if opts.CheckPrecondFn != nil && opts.CheckPrecondFn(oi) {
@@ -604,8 +816,9 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
 		return nil, 0, 0, err
 	}
 
-	// if object is encrypted and it is a restore request, fetch content without decrypting.
-	if opts.Transition.RestoreRequest != nil {
+	// if object is encrypted and it is a restore request or if NoDecryption
+	// was requested, fetch content without decrypting.
+	if opts.Transition.RestoreRequest != nil || opts.NoDecryption {
 		isEncrypted = false
 		isCompressed = false
 	}
@@ -627,6 +840,8 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
 		if err != nil {
 			return nil, 0, 0, err
 		}
+		var decryptSkip int64
+		var seqNum uint32
 
 		off, length = int64(0), oi.Size
 		decOff, decLength := int64(0), actualSize
@@ -635,10 +850,16 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
 			if err != nil {
 				return nil, 0, 0, err
 			}
-
+			decrypt := func(b []byte) ([]byte, error) {
+				return b, nil
+			}
+			if isEncrypted {
+				decrypt = func(b []byte) ([]byte, error) {
+					return oi.compressionIndexDecrypt(b, h)
+				}
+			}
 			// In case of range based queries on multiparts, the offset and length are reduced.
-			off, decOff, firstPart = getCompressedOffsets(oi, off)
-
+			off, decOff, firstPart, decryptSkip, seqNum = getCompressedOffsets(oi, off, decrypt)
 			decLength = length
 			length = oi.Size - off
 			// For negative length we read everything.
@@ -655,7 +876,7 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
 			if isEncrypted {
 				copySource := h.Get(xhttp.AmzServerSideEncryptionCopyCustomerAlgorithm) != ""
 				// Attach decrypter on inputReader
-				inputReader, err = DecryptBlocksRequestR(inputReader, h, 0, firstPart, oi, copySource)
+				inputReader, err = DecryptBlocksRequestR(inputReader, h, seqNum, firstPart, oi, copySource)
 				if err != nil {
 					// Call the cleanup funcs
 					for i := len(cFns) - 1; i >= 0; i-- {
@@ -663,10 +884,18 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
 					}
 					return nil, err
 				}
+				if decryptSkip > 0 {
+					inputReader = ioutil.NewSkipReader(inputReader, decryptSkip)
+				}
 				oi.Size = decLength
 			}
 			// Decompression reader.
-			s2Reader := s2.NewReader(inputReader)
+			var dopts []s2.ReaderOption
+			if off > 0 || decOff > 0 {
+				// We are not starting at the beginning, so ignore stream identifiers.
+				dopts = append(dopts, s2.ReaderIgnoreStreamIdentifier())
+			}
+			s2Reader := s2.NewReader(inputReader, dopts...)
 			// Apply the skipLen and limit on the decompressed stream.
 			if decOff > 0 {
 				if err = s2Reader.Skip(decOff); err != nil {
@@ -695,7 +924,6 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
 				ObjInfo:    oi,
 				Reader:     decReader,
 				cleanUpFns: cFns,
-				opts:       opts,
 			}
 			return r, nil
 		}
@@ -749,7 +977,6 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
 				ObjInfo:    oi,
 				Reader:     decReader,
 				cleanUpFns: cFns,
-				opts:       opts,
 			}
 			return r, nil
 		}
@@ -764,7 +991,6 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
 				ObjInfo:    oi,
 				Reader:     inputReader,
 				cleanUpFns: cFns,
-				opts:       opts,
 			}
 			return r, nil
 		}
@@ -785,6 +1011,25 @@ func (g *GetObjectReader) Close() error {
 		}
 	})
 	return nil
+}
+
+// compressionIndexEncrypter returns a function that will read data from input,
+// encrypt it using the provided key and return the result.
+func compressionIndexEncrypter(key crypto.ObjectKey, input func() []byte) func() []byte {
+	var data []byte
+	var fetched bool
+	return func() []byte {
+		if !fetched {
+			data = input()
+			fetched = true
+		}
+		return metadataEncrypter(key)("compression-index", data)
+	}
+}
+
+// compressionIndexDecrypt reverses compressionIndexEncrypter.
+func (o *ObjectInfo) compressionIndexDecrypt(input []byte, h http.Header) ([]byte, error) {
+	return o.metadataDecrypter(h)("compression-index", input)
 }
 
 // SealMD5CurrFn seals md5sum with object encryption key and returns sealed
@@ -867,20 +1112,6 @@ func sealETagFn(key crypto.ObjectKey) SealMD5CurrFn {
 	return fn
 }
 
-// CleanMinioInternalMetadataKeys removes X-Amz-Meta- prefix from minio internal
-// encryption metadata that was sent by minio gateway
-func CleanMinioInternalMetadataKeys(metadata map[string]string) map[string]string {
-	newMeta := make(map[string]string, len(metadata))
-	for k, v := range metadata {
-		if strings.HasPrefix(k, "X-Amz-Meta-X-Minio-Internal-") {
-			newMeta[strings.TrimPrefix(k, "X-Amz-Meta-")] = v
-		} else {
-			newMeta[k] = v
-		}
-	}
-	return newMeta
-}
-
 // compressOpts are the options for writing compressed data.
 var compressOpts []s2.WriterOption
 
@@ -897,11 +1128,20 @@ func init() {
 // input 'on' is always recommended such that this function works
 // properly, because we do not wish to create an object even if
 // client closed the stream prematurely.
-func newS2CompressReader(r io.Reader, on int64) io.ReadCloser {
+func newS2CompressReader(r io.Reader, on int64, encrypted bool) (rc io.ReadCloser, idx func() []byte) {
 	pr, pw := io.Pipe()
 	// Copy input to compressor
+	opts := compressOpts
+	if encrypted {
+		// The values used for padding are not a security concern,
+		// but we choose pseudo-random numbers instead of just zeros.
+		rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+		opts = append([]s2.WriterOption{s2.WriterPadding(compPadEncrypted), s2.WriterPaddingSrc(rng)}, compressOpts...)
+	}
+	comp := s2.NewWriter(pw, opts...)
+	indexCh := make(chan []byte, 1)
 	go func() {
-		comp := s2.NewWriter(pw, compressOpts...)
+		defer xioutil.SafeClose(indexCh)
 		cn, err := io.Copy(comp, r)
 		if err != nil {
 			comp.Close()
@@ -916,9 +1156,25 @@ func newS2CompressReader(r io.Reader, on int64) io.ReadCloser {
 			return
 		}
 		// Close the stream.
+		// If more than compMinIndexSize was written, generate index.
+		if cn > compMinIndexSize {
+			idx, err := comp.CloseIndex()
+			idx = s2.RemoveIndexHeaders(idx)
+			indexCh <- idx
+			pw.CloseWithError(err)
+			return
+		}
 		pw.CloseWithError(comp.Close())
 	}()
-	return pr
+	var gotIdx []byte
+	return pr, func() []byte {
+		if gotIdx != nil {
+			return gotIdx
+		}
+		// Will get index or nil if closed.
+		gotIdx = <-indexCh
+		return gotIdx
+	}
 }
 
 // compressSelfTest performs a self-test to ensure that compression
@@ -942,7 +1198,7 @@ func compressSelfTest() {
 		}
 	}
 	const skip = 2<<20 + 511
-	r := newS2CompressReader(bytes.NewBuffer(data), int64(len(data)))
+	r, _ := newS2CompressReader(bytes.NewBuffer(data), int64(len(data)), true)
 	b, err := io.ReadAll(r)
 	failOnErr(err)
 	failOnErr(r.Close())
@@ -959,13 +1215,14 @@ func compressSelfTest() {
 
 // getDiskInfos returns the disk information for the provided disks.
 // If a disk is nil or an error is returned the result will be nil as well.
-func getDiskInfos(ctx context.Context, disks []StorageAPI) []*DiskInfo {
+func getDiskInfos(ctx context.Context, disks ...StorageAPI) []*DiskInfo {
 	res := make([]*DiskInfo, len(disks))
+	opts := DiskInfoOptions{}
 	for i, disk := range disks {
 		if disk == nil {
 			continue
 		}
-		if di, err := disk.DiskInfo(ctx); err == nil {
+		if di, err := disk.DiskInfo(ctx, opts); err == nil {
 			res[i] = &di
 		}
 	}
@@ -973,7 +1230,7 @@ func getDiskInfos(ctx context.Context, disks []StorageAPI) []*DiskInfo {
 }
 
 // hasSpaceFor returns whether the disks in `di` have space for and object of a given size.
-func hasSpaceFor(di []*DiskInfo, size int64) bool {
+func hasSpaceFor(di []*DiskInfo, size int64) (bool, error) {
 	// We multiply the size by 2 to account for erasure coding.
 	size *= 2
 	if size < 0 {
@@ -985,7 +1242,7 @@ func hasSpaceFor(di []*DiskInfo, size int64) bool {
 	var total uint64
 	var nDisks int
 	for _, disk := range di {
-		if disk == nil || disk.Total == 0 || (disk.FreeInodes < diskMinInodes && disk.UsedInodes > 0) {
+		if disk == nil || disk.Total == 0 {
 			// Disk offline, no inodes or something else is wrong.
 			continue
 		}
@@ -994,24 +1251,41 @@ func hasSpaceFor(di []*DiskInfo, size int64) bool {
 		available += disk.Total - disk.Used
 	}
 
-	if nDisks == 0 {
-		return false
+	if nDisks < len(di)/2 || nDisks <= 0 {
+		var errs []error
+		for index, disk := range di {
+			switch {
+			case disk == nil:
+				errs = append(errs, fmt.Errorf("disk[%d]: offline", index))
+			case disk.Error != "":
+				errs = append(errs, fmt.Errorf("disk %s: %s", disk.Endpoint, disk.Error))
+			case disk.Total == 0:
+				errs = append(errs, fmt.Errorf("disk %s: total is zero", disk.Endpoint))
+			}
+		}
+		// Log disk errors.
+		peersLogIf(context.Background(), errors.Join(errs...))
+		return false, fmt.Errorf("not enough online disks to calculate the available space, need %d, found %d", (len(di)/2)+1, nDisks)
 	}
 
 	// Check we have enough on each disk, ignoring diskFillFraction.
 	perDisk := size / int64(nDisks)
 	for _, disk := range di {
-		if disk == nil || disk.Total == 0 || (disk.FreeInodes < diskMinInodes && disk.UsedInodes > 0) {
+		if disk == nil || disk.Total == 0 {
 			continue
 		}
+		if !globalIsErasureSD && disk.FreeInodes < diskMinInodes && disk.UsedInodes > 0 {
+			// We have an inode count, but not enough inodes.
+			return false, nil
+		}
 		if int64(disk.Free) <= perDisk {
-			return false
+			return false, nil
 		}
 	}
 
 	// Make sure we can fit "size" on to the disk without getting above the diskFillFraction
 	if available < uint64(size) {
-		return false
+		return false, nil
 	}
 
 	// How much will be left after adding the file.
@@ -1019,5 +1293,5 @@ func hasSpaceFor(di []*DiskInfo, size int64) bool {
 
 	// wantLeft is how much space there at least must be left.
 	wantLeft := uint64(float64(total) * (1.0 - diskFillFraction))
-	return available > wantLeft
+	return available > wantLeft, nil
 }

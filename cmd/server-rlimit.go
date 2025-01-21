@@ -21,14 +21,33 @@ import (
 	"runtime"
 	"runtime/debug"
 
+	"github.com/dustin/go-humanize"
+	"github.com/minio/madmin-go/v3/kernel"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/sys"
+	"github.com/minio/pkg/v3/sys"
 )
 
-func setMaxResources() (err error) {
+func oldLinux() bool {
+	currentKernel, err := kernel.CurrentVersion()
+	if err != nil {
+		// Could not probe the kernel version
+		return false
+	}
+
+	if currentKernel == 0 {
+		// We could not get any valid value return false
+		return false
+	}
+
+	// legacy linux indicator for printing warnings
+	// about older Linux kernels and Go runtime.
+	return currentKernel < kernel.Version(4, 0, 0)
+}
+
+func setMaxResources(ctx serverCtxt) (err error) {
 	// Set the Go runtime max threads threshold to 90% of kernel setting.
-	sysMaxThreads, mErr := sys.GetMaxThreads()
-	if mErr == nil {
+	sysMaxThreads, err := sys.GetMaxThreads()
+	if err == nil {
 		minioMaxThreads := (sysMaxThreads * 90) / 100
 		// Only set max threads if it is greater than the default one
 		if minioMaxThreads > 10000 {
@@ -44,18 +63,32 @@ func setMaxResources() (err error) {
 	}
 
 	if maxLimit < 4096 && runtime.GOOS != globalWindowsOSName {
-		logger.Info("WARNING: maximum file descriptor limit %d is too low for production servers. At least 4096 is recommended. Fix with \"ulimit -n 4096\"", maxLimit)
+		logger.Info("WARNING: maximum file descriptor limit %d is too low for production servers. At least 4096 is recommended. Fix with \"ulimit -n 4096\"",
+			maxLimit)
 	}
 
 	if err = sys.SetMaxOpenFileLimit(maxLimit, maxLimit); err != nil {
 		return err
 	}
 
-	// Set max memory limit as current memory limit.
-	if _, maxLimit, err = sys.GetMaxMemoryLimit(); err != nil {
+	_, vssLimit, err := sys.GetMaxMemoryLimit()
+	if err != nil {
 		return err
 	}
 
-	err = sys.SetMaxMemoryLimit(maxLimit, maxLimit)
-	return err
+	if vssLimit > 0 && vssLimit < humanize.GiByte {
+		logger.Info("WARNING: maximum virtual memory limit (%s) is too small for 'go runtime', please consider setting `ulimit -v` to unlimited",
+			humanize.IBytes(vssLimit))
+	}
+
+	if ctx.MemLimit > 0 {
+		debug.SetMemoryLimit(int64(ctx.MemLimit))
+	}
+
+	// Do not use RLIMIT_AS as that is not useful and at times on systems < 4Gi
+	// this can crash the Go runtime if the value is smaller refer
+	// - https://github.com/golang/go/issues/38010
+	// - https://github.com/golang/go/issues/43699
+	// So do not add `sys.SetMaxMemoryLimit()` this is not useful for any practical purposes.
+	return nil
 }

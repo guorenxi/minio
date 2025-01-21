@@ -18,6 +18,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -36,6 +37,12 @@ func niceError(code APIErrorCode) string {
 }
 
 func TestDoesPolicySignatureMatch(t *testing.T) {
+	_, fsDir, err := prepareFS(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer removeRoots([]string{fsDir})
+
 	credentialTemplate := "%s/%s/%s/s3/aws4_request"
 	now := UTCNow()
 	accessKey := globalActiveCred.AccessKey
@@ -93,7 +100,10 @@ func TestDoesPolicySignatureMatch(t *testing.T) {
 }
 
 func TestDoesPresignedSignatureMatch(t *testing.T) {
-	obj, fsDir, err := prepareFS()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	obj, fsDir, err := prepareFS(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +117,7 @@ func TestDoesPresignedSignatureMatch(t *testing.T) {
 	now := UTCNow()
 	credentialTemplate := "%s/%s/%s/s3/aws4_request"
 
-	region := globalSite.Region
+	region := globalSite.Region()
 	accessKeyID := globalActiveCred.AccessKey
 	testCases := []struct {
 		queryParams map[string]string
@@ -216,7 +226,7 @@ func TestDoesPresignedSignatureMatch(t *testing.T) {
 			expected: ErrRequestNotReadyYet,
 		},
 		// (7) Should not error with invalid region instead, call should proceed
-		// with sigature does not match.
+		// with signature does not match.
 		{
 			queryParams: map[string]string{
 				"X-Amz-Algorithm":      signV4Algorithm,
