@@ -27,7 +27,7 @@ import (
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/klauspost/compress/s2"
-	"github.com/minio/minio/internal/logger"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/tinylib/msgp/msgp"
 	"github.com/valyala/bytebufferpool"
 )
@@ -184,6 +184,9 @@ func (w *metacacheWriter) stream() (chan<- metaCacheEntry, error) {
 				continue
 			}
 			err = w.mw.WriteBytes(o.metadata)
+			if w.reuseBlocks || o.reusable {
+				metaDataPoolPut(o.metadata)
+			}
 			if err != nil {
 				w.streamErr = err
 				continue
@@ -252,12 +255,13 @@ type metacacheReader struct {
 func newMetacacheReader(r io.Reader) *metacacheReader {
 	dec := s2DecPool.Get().(*s2.Reader)
 	dec.Reset(r)
-	mr := msgp.NewReader(dec)
+	mr := msgpNewReader(dec)
 	return &metacacheReader{
 		mr: mr,
 		closer: func() {
 			dec.Reset(nil)
 			s2DecPool.Put(dec)
+			readMsgpReaderPoolPut(mr)
 		},
 		creator: func() error {
 			v, err := mr.ReadByte()
@@ -546,7 +550,7 @@ func (r *metacacheReader) readAll(ctx context.Context, dst chan<- metaCacheEntry
 	if r.err != nil {
 		return r.err
 	}
-	defer close(dst)
+	defer xioutil.SafeClose(dst)
 	if r.current.name != "" {
 		select {
 		case <-ctx.Done():
@@ -559,8 +563,7 @@ func (r *metacacheReader) readAll(ctx context.Context, dst chan<- metaCacheEntry
 	}
 	for {
 		if more, err := r.mr.ReadBool(); !more {
-			switch err {
-			case io.EOF:
+			if err == io.EOF {
 				err = io.ErrUnexpectedEOF
 			}
 			r.err = err
@@ -841,7 +844,7 @@ func (b metacacheBlock) headerKV() map[string]string {
 	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	v, err := json.Marshal(b)
 	if err != nil {
-		logger.LogIf(context.Background(), err) // Unlikely
+		bugLogIf(context.Background(), err) // Unlikely
 		return nil
 	}
 	return map[string]string{fmt.Sprintf("%s-metacache-part-%d", ReservedMetadataPrefixLower, b.n): string(v)}

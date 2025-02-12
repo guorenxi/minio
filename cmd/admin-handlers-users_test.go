@@ -24,22 +24,23 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
-	"os"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/minio/madmin-go"
-	minio "github.com/minio/minio-go/v7"
+	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-	cr "github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/s3utils"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio-go/v7/pkg/signer"
 	"github.com/minio/minio/internal/auth"
+	"github.com/minio/pkg/v3/env"
 )
 
 const (
@@ -50,6 +51,8 @@ const (
 type TestSuiteIAM struct {
 	TestSuiteCommon
 
+	ServerTypeDescription string
+
 	// Flag to turn on tests for etcd backend IAM
 	withEtcdBackend bool
 
@@ -59,7 +62,15 @@ type TestSuiteIAM struct {
 }
 
 func newTestSuiteIAM(c TestSuiteCommon, withEtcdBackend bool) *TestSuiteIAM {
-	return &TestSuiteIAM{TestSuiteCommon: c, withEtcdBackend: withEtcdBackend}
+	etcdStr := ""
+	if withEtcdBackend {
+		etcdStr = " (with etcd backend)"
+	}
+	return &TestSuiteIAM{
+		TestSuiteCommon:       c,
+		ServerTypeDescription: fmt.Sprintf("%s%s", c.serverType, etcdStr),
+		withEtcdBackend:       withEtcdBackend,
+	}
 }
 
 func (s *TestSuiteIAM) iamSetup(c *check) {
@@ -87,8 +98,31 @@ func (s *TestSuiteIAM) iamSetup(c *check) {
 	}
 }
 
+// List of all IAM test suites (i.e. test server configuration combinations)
+// common to tests.
+var iamTestSuites = func() []*TestSuiteIAM {
+	baseTestCases := []TestSuiteCommon{
+		// Init and run test on ErasureSD backend with signature v4.
+		{serverType: "ErasureSD", signer: signerV4},
+		// Init and run test on ErasureSD backend, with tls enabled.
+		{serverType: "ErasureSD", signer: signerV4, secure: true},
+		// Init and run test on Erasure backend.
+		{serverType: "Erasure", signer: signerV4},
+		// Init and run test on ErasureSet backend.
+		{serverType: "ErasureSet", signer: signerV4},
+	}
+	testCases := []*TestSuiteIAM{}
+	for _, bt := range baseTestCases {
+		testCases = append(testCases,
+			newTestSuiteIAM(bt, false),
+			newTestSuiteIAM(bt, true),
+		)
+	}
+	return testCases
+}()
+
 const (
-	EnvTestEtcdBackend = "ETCD_SERVER"
+	EnvTestEtcdBackend = "_MINIO_ETCD_TEST_SERVER"
 )
 
 func (s *TestSuiteIAM) setUpEtcd(c *check, etcdServer string) {
@@ -111,7 +145,7 @@ func (s *TestSuiteIAM) setUpEtcd(c *check, etcdServer string) {
 func (s *TestSuiteIAM) SetUpSuite(c *check) {
 	// If etcd backend is specified and etcd server is not present, the test
 	// is skipped.
-	etcdServer := os.Getenv(EnvTestEtcdBackend)
+	etcdServer := env.Get(EnvTestEtcdBackend, "")
 	if s.withEtcdBackend && etcdServer == "" {
 		c.Skip("Skipping etcd backend IAM test as no etcd server is configured.")
 	}
@@ -156,30 +190,12 @@ func (s *TestSuiteIAM) getUserClient(c *check, accessKey, secretKey, sessionToke
 }
 
 func TestIAMInternalIDPServerSuite(t *testing.T) {
-	baseTestCases := []TestSuiteCommon{
-		// Init and run test on FS backend with signature v4.
-		{serverType: "FS", signer: signerV4},
-		// Init and run test on FS backend, with tls enabled.
-		{serverType: "FS", signer: signerV4, secure: true},
-		// Init and run test on Erasure backend.
-		{serverType: "Erasure", signer: signerV4},
-		// Init and run test on ErasureSet backend.
-		{serverType: "ErasureSet", signer: signerV4},
+	if runtime.GOOS == globalWindowsOSName {
+		t.Skip("windows is clunky disable these tests")
 	}
-	testCases := []*TestSuiteIAM{}
-	for _, bt := range baseTestCases {
-		testCases = append(testCases,
-			newTestSuiteIAM(bt, false),
-			newTestSuiteIAM(bt, true),
-		)
-	}
-	for i, testCase := range testCases {
-		etcdStr := ""
-		if testCase.withEtcdBackend {
-			etcdStr = " (with etcd backend)"
-		}
+	for i, testCase := range iamTestSuites {
 		t.Run(
-			fmt.Sprintf("Test: %d, ServerType: %s%s", i+1, testCase.serverType, etcdStr),
+			fmt.Sprintf("Test: %d, ServerType: %s", i+1, testCase.ServerTypeDescription),
 			func(t *testing.T) {
 				suite := testCase
 				c := &check{t, testCase.serverType}
@@ -191,7 +207,9 @@ func TestIAMInternalIDPServerSuite(t *testing.T) {
 				suite.TestCannedPolicies(c)
 				suite.TestGroupAddRemove(c)
 				suite.TestServiceAccountOpsByAdmin(c)
+				suite.TestServiceAccountPrivilegeEscalationBug(c)
 				suite.TestServiceAccountOpsByUser(c)
+				suite.TestServiceAccountDurationSecondsCondition(c)
 				suite.TestAddServiceAccountPerms(c)
 				suite.TearDownSuite(c)
 			},
@@ -222,10 +240,14 @@ func (s *TestSuiteIAM) TestUserCreate(c *check) {
 	c.Assert(v.Status, madmin.AccountEnabled)
 
 	// 3. Associate policy and check that user can access
-	err = s.adm.SetPolicy(ctx, "readwrite", accessKey, false)
+	_, err = s.adm.AttachPolicy(ctx, madmin.PolicyAssociationReq{
+		Policies: []string{"readwrite"},
+		User:     accessKey,
+	})
 	if err != nil {
-		c.Fatalf("unable to set policy: %v", err)
+		c.Fatalf("unable to attach policy: %v", err)
 	}
+
 	client := s.getUserClient(c, accessKey, secretKey, "")
 	err = client.MakeBucket(ctx, getRandomBucketName(), minio.MakeBucketOptions{})
 	if err != nil {
@@ -316,23 +338,34 @@ func (s *TestSuiteIAM) TestUserPolicyEscalationBug(c *check) {
   {
    "Effect": "Allow",
    "Action": [
-    "s3:PutObject",
-    "s3:GetObject",
     "s3:ListBucket"
+   ],
+   "Resource": [
+    "arn:aws:s3:::%s"
+   ]
+  },
+  {
+   "Effect": "Allow",
+   "Action": [
+    "s3:PutObject",
+    "s3:GetObject"
    ],
    "Resource": [
     "arn:aws:s3:::%s/*"
    ]
   }
  ]
-}`, bucket))
+}`, bucket, bucket))
 	err = s.adm.AddCannedPolicy(ctx, policy, policyBytes)
 	if err != nil {
 		c.Fatalf("policy add error: %v", err)
 	}
-	err = s.adm.SetPolicy(ctx, policy, accessKey, false)
+	_, err = s.adm.AttachPolicy(ctx, madmin.PolicyAssociationReq{
+		Policies: []string{policy},
+		User:     accessKey,
+	})
 	if err != nil {
-		c.Fatalf("Unable to set policy: %v", err)
+		c.Fatalf("unable to attach policy: %v", err)
 	}
 	// 2.3 check user has access to bucket
 	c.mustListObjects(ctx, uClient, bucket)
@@ -371,7 +404,7 @@ func (s *TestSuiteIAM) TestUserPolicyEscalationBug(c *check) {
 	req.ContentLength = int64(len(buf))
 	sum := sha256.Sum256(buf)
 	req.Header.Set("X-Amz-Content-Sha256", hex.EncodeToString(sum[:]))
-	req.Body = ioutil.NopCloser(bytes.NewReader(buf))
+	req.Body = io.NopCloser(bytes.NewReader(buf))
 	req = signer.SignV4(*req, accessKey, secretKey, "", "")
 
 	// 3.1 Execute the request.
@@ -418,7 +451,7 @@ func (s *TestSuiteIAM) TestAddServiceAccountPerms(c *check) {
     "s3:ListBucket"
    ],
    "Resource": [
-    "arn:aws:s3:::testbucket/*"
+    "arn:aws:s3:::testbucket"
    ]
   }
  ]
@@ -452,9 +485,12 @@ func (s *TestSuiteIAM) TestAddServiceAccountPerms(c *check) {
 	c.mustNotListObjects(ctx, uClient, "testbucket")
 
 	// 3.2 associate policy to user
-	err = s.adm.SetPolicy(ctx, policy1, accessKey, false)
+	_, err = s.adm.AttachPolicy(ctx, madmin.PolicyAssociationReq{
+		Policies: []string{policy1},
+		User:     accessKey,
+	})
 	if err != nil {
-		c.Fatalf("Unable to set policy: %v", err)
+		c.Fatalf("unable to attach policy: %v", err)
 	}
 
 	admClnt := s.getAdminClient(c, accessKey, secretKey, "")
@@ -472,10 +508,22 @@ func (s *TestSuiteIAM) TestAddServiceAccountPerms(c *check) {
 		c.Fatalf("policy was missing!")
 	}
 
-	// 3.2 associate policy to user
-	err = s.adm.SetPolicy(ctx, policy2, accessKey, false)
+	// Detach policy1 to set up for policy2
+	_, err = s.adm.DetachPolicy(ctx, madmin.PolicyAssociationReq{
+		Policies: []string{policy1},
+		User:     accessKey,
+	})
 	if err != nil {
-		c.Fatalf("Unable to set policy: %v", err)
+		c.Fatalf("unable to detach policy: %v", err)
+	}
+
+	// 3.2 associate policy to user
+	_, err = s.adm.AttachPolicy(ctx, madmin.PolicyAssociationReq{
+		Policies: []string{policy2},
+		User:     accessKey,
+	})
+	if err != nil {
+		c.Fatalf("unable to attach policy: %v", err)
 	}
 
 	// 3.3 check user can create service account implicitly.
@@ -520,16 +568,24 @@ func (s *TestSuiteIAM) TestPolicyCreate(c *check) {
   {
    "Effect": "Allow",
    "Action": [
-    "s3:PutObject",
-    "s3:GetObject",
     "s3:ListBucket"
+   ],
+   "Resource": [
+    "arn:aws:s3:::%s"
+   ]
+  },
+  {
+   "Effect": "Allow",
+   "Action": [
+    "s3:PutObject",
+    "s3:GetObject"
    ],
    "Resource": [
     "arn:aws:s3:::%s/*"
    ]
   }
  ]
-}`, bucket))
+}`, bucket, bucket))
 	err = s.adm.AddCannedPolicy(ctx, policy, policyBytes)
 	if err != nil {
 		c.Fatalf("policy add error: %v", err)
@@ -553,9 +609,12 @@ func (s *TestSuiteIAM) TestPolicyCreate(c *check) {
 	c.mustNotListObjects(ctx, uClient, bucket)
 
 	// 3.2 associate policy to user
-	err = s.adm.SetPolicy(ctx, policy, accessKey, false)
+	_, err = s.adm.AttachPolicy(ctx, madmin.PolicyAssociationReq{
+		Policies: []string{policy},
+		User:     accessKey,
+	})
 	if err != nil {
-		c.Fatalf("Unable to set policy: %v", err)
+		c.Fatalf("unable to attach policy: %v", err)
 	}
 	// 3.3 check user has access to bucket
 	c.mustListObjects(ctx, uClient, bucket)
@@ -627,16 +686,24 @@ func (s *TestSuiteIAM) TestCannedPolicies(c *check) {
   {
    "Effect": "Allow",
    "Action": [
-    "s3:PutObject",
-    "s3:GetObject",
     "s3:ListBucket"
+   ],
+   "Resource": [
+    "arn:aws:s3:::%s"
+   ]
+  },
+  {
+   "Effect": "Allow",
+   "Action": [
+    "s3:PutObject",
+    "s3:GetObject"
    ],
    "Resource": [
     "arn:aws:s3:::%s/*"
    ]
   }
  ]
-}`, bucket))
+}`, bucket, bucket))
 
 	// Check that default policies can be overwritten.
 	err = s.adm.AddCannedPolicy(ctx, "readwrite", policyBytes)
@@ -647,6 +714,12 @@ func (s *TestSuiteIAM) TestCannedPolicies(c *check) {
 	info, err := s.adm.InfoCannedPolicy(ctx, "readwrite")
 	if err != nil {
 		c.Fatalf("policy info err: %v", err)
+	}
+
+	// Check that policy with comma is rejected.
+	err = s.adm.AddCannedPolicy(ctx, "invalid,policy", policyBytes)
+	if err == nil {
+		c.Fatalf("invalid policy created successfully")
 	}
 
 	infoStr := string(info)
@@ -672,16 +745,24 @@ func (s *TestSuiteIAM) TestGroupAddRemove(c *check) {
   {
    "Effect": "Allow",
    "Action": [
-    "s3:PutObject",
-    "s3:GetObject",
     "s3:ListBucket"
+   ],
+   "Resource": [
+    "arn:aws:s3:::%s"
+   ]
+  },
+  {
+   "Effect": "Allow",
+   "Action": [
+    "s3:PutObject",
+    "s3:GetObject"
    ],
    "Resource": [
     "arn:aws:s3:::%s/*"
    ]
   }
  ]
-}`, bucket))
+}`, bucket, bucket))
 	err = s.adm.AddCannedPolicy(ctx, policy, policyBytes)
 	if err != nil {
 		c.Fatalf("policy add error: %v", err)
@@ -708,9 +789,12 @@ func (s *TestSuiteIAM) TestGroupAddRemove(c *check) {
 	c.mustNotListObjects(ctx, uClient, bucket)
 
 	// 3. Associate policy to group and check user got access.
-	err = s.adm.SetPolicy(ctx, policy, group, true)
+	_, err = s.adm.AttachPolicy(ctx, madmin.PolicyAssociationReq{
+		Policies: []string{policy},
+		Group:    group,
+	})
 	if err != nil {
-		c.Fatalf("Unable to set policy: %v", err)
+		c.Fatalf("unable to attach policy: %v", err)
 	}
 	// 3.1 check user has access to bucket
 	c.mustListObjects(ctx, uClient, bucket)
@@ -725,8 +809,9 @@ func (s *TestSuiteIAM) TestGroupAddRemove(c *check) {
 	if err != nil {
 		c.Fatalf("group list err: %v", err)
 	}
-	if !set.CreateStringSet(groups...).Contains(group) {
-		c.Fatalf("created group not present!")
+	expected := []string{group}
+	if !slices.Equal(groups, expected) {
+		c.Fatalf("expected group listing: %v, got: %v", expected, groups)
 	}
 	groupInfo, err := s.adm.GetGroupDescription(ctx, group)
 	if err != nil {
@@ -808,7 +893,7 @@ func (s *TestSuiteIAM) TestGroupAddRemove(c *check) {
 	if set.CreateStringSet(groups...).Contains(group) {
 		c.Fatalf("created group still present!")
 	}
-	groupInfo, err = s.adm.GetGroupDescription(ctx, group)
+	_, err = s.adm.GetGroupDescription(ctx, group)
 	if err == nil {
 		c.Fatalf("group appears to exist")
 	}
@@ -832,16 +917,24 @@ func (s *TestSuiteIAM) TestServiceAccountOpsByUser(c *check) {
   {
    "Effect": "Allow",
    "Action": [
-    "s3:PutObject",
-    "s3:GetObject",
     "s3:ListBucket"
+   ],
+   "Resource": [
+    "arn:aws:s3:::%s"
+   ]
+  },
+  {
+   "Effect": "Allow",
+   "Action": [
+    "s3:PutObject",
+    "s3:GetObject"
    ],
    "Resource": [
     "arn:aws:s3:::%s/*"
    ]
   }
  ]
-}`, bucket))
+}`, bucket, bucket))
 	err = s.adm.AddCannedPolicy(ctx, policy, policyBytes)
 	if err != nil {
 		c.Fatalf("policy add error: %v", err)
@@ -853,14 +946,17 @@ func (s *TestSuiteIAM) TestServiceAccountOpsByUser(c *check) {
 		c.Fatalf("Unable to set user: %v", err)
 	}
 
-	err = s.adm.SetPolicy(ctx, policy, accessKey, false)
+	_, err = s.adm.AttachPolicy(ctx, madmin.PolicyAssociationReq{
+		Policies: []string{policy},
+		User:     accessKey,
+	})
 	if err != nil {
-		c.Fatalf("Unable to set policy: %v", err)
+		c.Fatalf("unable to attach policy: %v", err)
 	}
 
 	// Create an madmin client with user creds
 	userAdmClient, err := madmin.NewWithOptions(s.endpoint, &madmin.Options{
-		Creds:  cr.NewStaticV4(accessKey, secretKey, ""),
+		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
 		Secure: s.secure,
 	})
 	if err != nil {
@@ -880,16 +976,109 @@ func (s *TestSuiteIAM) TestServiceAccountOpsByUser(c *check) {
 	// 3. Check S3 access
 	c.assertSvcAccS3Access(ctx, s, cr, bucket)
 
-	// 4. Check that svc account can restrict the policy, and that the
-	// session policy can be updated.
-	c.assertSvcAccSessionPolicyUpdate(ctx, s, userAdmClient, accessKey, bucket)
-
-	// 4. Check that service account's secret key and account status can be
-	// updated.
-	c.assertSvcAccSecretKeyAndStatusUpdate(ctx, s, userAdmClient, accessKey, bucket)
-
 	// 5. Check that service account can be deleted.
 	c.assertSvcAccDeletion(ctx, s, userAdmClient, accessKey, bucket)
+
+	// 6. Check that service account cannot be created for some other user.
+	c.mustNotCreateSvcAccount(ctx, globalActiveCred.AccessKey, userAdmClient)
+}
+
+func (s *TestSuiteIAM) TestServiceAccountDurationSecondsCondition(c *check) {
+	ctx, cancel := context.WithTimeout(context.Background(), testDefaultTimeout)
+	defer cancel()
+
+	bucket := getRandomBucketName()
+	err := s.client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{})
+	if err != nil {
+		c.Fatalf("bucket creat error: %v", err)
+	}
+
+	// Create policy, user and associate policy
+	policy := "mypolicy"
+	policyBytes := []byte(fmt.Sprintf(`{
+ "Version": "2012-10-17",
+ "Statement": [
+  {
+   "Effect": "Deny",
+   "Action": [
+     "admin:CreateServiceAccount",
+     "admin:UpdateServiceAccount"
+   ],
+   "Condition": {"NumericGreaterThan": {"svc:DurationSeconds": "3600"}}
+  },
+  {
+   "Effect": "Allow",
+   "Action": [
+    "s3:ListBucket"
+   ],
+   "Resource": [
+    "arn:aws:s3:::%s"
+   ]
+  },
+  {
+   "Effect": "Allow",
+   "Action": [
+    "s3:PutObject",
+    "s3:GetObject"
+   ],
+   "Resource": [
+    "arn:aws:s3:::%s/*"
+   ]
+  }
+ ]
+}`, bucket, bucket))
+	err = s.adm.AddCannedPolicy(ctx, policy, policyBytes)
+	if err != nil {
+		c.Fatalf("policy add error: %v", err)
+	}
+
+	accessKey, secretKey := mustGenerateCredentials(c)
+	err = s.adm.SetUser(ctx, accessKey, secretKey, madmin.AccountEnabled)
+	if err != nil {
+		c.Fatalf("Unable to set user: %v", err)
+	}
+
+	_, err = s.adm.AttachPolicy(ctx, madmin.PolicyAssociationReq{
+		Policies: []string{policy},
+		User:     accessKey,
+	})
+	if err != nil {
+		c.Fatalf("unable to attach policy: %v", err)
+	}
+
+	// Create an madmin client with user creds
+	userAdmClient, err := madmin.NewWithOptions(s.endpoint, &madmin.Options{
+		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
+		Secure: s.secure,
+	})
+	if err != nil {
+		c.Fatalf("Err creating user admin client: %v", err)
+	}
+	userAdmClient.SetCustomTransport(s.TestSuiteCommon.client.Transport)
+
+	distantExpiration := time.Now().Add(30 * time.Minute)
+	cr, err := userAdmClient.AddServiceAccount(ctx, madmin.AddServiceAccountReq{
+		TargetUser: accessKey,
+		AccessKey:  "svc-accesskey",
+		SecretKey:  "svc-secretkey",
+		Expiration: &distantExpiration,
+	})
+	if err != nil {
+		c.Fatalf("Unable to create svc acc: %v", err)
+	}
+
+	c.assertSvcAccS3Access(ctx, s, cr, bucket)
+
+	closeExpiration := time.Now().Add(2 * time.Hour)
+	_, err = userAdmClient.AddServiceAccount(ctx, madmin.AddServiceAccountReq{
+		TargetUser: accessKey,
+		AccessKey:  "svc-accesskey",
+		SecretKey:  "svc-secretkey",
+		Expiration: &closeExpiration,
+	})
+	if err == nil {
+		c.Fatalf("Creating a svc acc with distant expiration should fail")
+	}
 }
 
 func (s *TestSuiteIAM) TestServiceAccountOpsByAdmin(c *check) {
@@ -910,16 +1099,24 @@ func (s *TestSuiteIAM) TestServiceAccountOpsByAdmin(c *check) {
   {
    "Effect": "Allow",
    "Action": [
-    "s3:PutObject",
-    "s3:GetObject",
     "s3:ListBucket"
+   ],
+   "Resource": [
+    "arn:aws:s3:::%s"
+   ]
+  },
+  {
+   "Effect": "Allow",
+   "Action": [
+    "s3:PutObject",
+    "s3:GetObject"
    ],
    "Resource": [
     "arn:aws:s3:::%s/*"
    ]
   }
  ]
-}`, bucket))
+}`, bucket, bucket))
 	err = s.adm.AddCannedPolicy(ctx, policy, policyBytes)
 	if err != nil {
 		c.Fatalf("policy add error: %v", err)
@@ -931,9 +1128,12 @@ func (s *TestSuiteIAM) TestServiceAccountOpsByAdmin(c *check) {
 		c.Fatalf("Unable to set user: %v", err)
 	}
 
-	err = s.adm.SetPolicy(ctx, policy, accessKey, false)
+	_, err = s.adm.AttachPolicy(ctx, madmin.PolicyAssociationReq{
+		Policies: []string{policy},
+		User:     accessKey,
+	})
 	if err != nil {
-		c.Fatalf("Unable to set policy: %v", err)
+		c.Fatalf("unable to attach policy: %v", err)
 	}
 
 	// 1. Create a service account for the user
@@ -960,7 +1160,257 @@ func (s *TestSuiteIAM) TestServiceAccountOpsByAdmin(c *check) {
 	c.assertSvcAccDeletion(ctx, s, s.adm, accessKey, bucket)
 }
 
+func (s *TestSuiteIAM) TestServiceAccountPrivilegeEscalationBug(c *check) {
+	ctx, cancel := context.WithTimeout(context.Background(), testDefaultTimeout)
+	defer cancel()
+
+	err := s.client.MakeBucket(ctx, "public", minio.MakeBucketOptions{})
+	if err != nil {
+		c.Fatalf("bucket creat error: %v", err)
+	}
+
+	err = s.client.MakeBucket(ctx, "private", minio.MakeBucketOptions{})
+	if err != nil {
+		c.Fatalf("bucket creat error: %v", err)
+	}
+
+	pubPolicyBytes := []byte(`{
+ "Version": "2012-10-17",
+ "Statement": [
+  {
+   "Effect": "Allow",
+   "Action": [
+    "s3:*"
+   ],
+   "Resource": [
+    "arn:aws:s3:::public",
+    "arn:aws:s3:::public/*"
+   ]
+  }
+ ]
+}`)
+
+	fullS3PolicyBytes := []byte(`{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:*"
+      ],
+      "Resource": [
+        "arn:aws:s3:::*"
+      ]
+    }
+  ]
+}
+`)
+
+	// Create a service account for the root user.
+	cr, err := s.adm.AddServiceAccount(ctx, madmin.AddServiceAccountReq{
+		TargetUser: globalActiveCred.AccessKey,
+		Policy:     pubPolicyBytes,
+	})
+	if err != nil {
+		c.Fatalf("admin should be able to create service account for themselves %s", err)
+	}
+
+	svcClient := s.getUserClient(c, cr.AccessKey, cr.SecretKey, "")
+
+	// Check that the service account can access the public bucket.
+	buckets, err := svcClient.ListBuckets(ctx)
+	if err != nil {
+		c.Fatalf("err fetching buckets %s", err)
+	}
+	if len(buckets) != 1 || buckets[0].Name != "public" {
+		c.Fatalf("service account should only have access to public bucket")
+	}
+
+	// Create an madmin client with the service account creds.
+	svcAdmClient, err := madmin.NewWithOptions(s.endpoint, &madmin.Options{
+		Creds:  credentials.NewStaticV4(cr.AccessKey, cr.SecretKey, ""),
+		Secure: s.secure,
+	})
+	if err != nil {
+		c.Fatalf("Err creating svcacct admin client: %v", err)
+	}
+	svcAdmClient.SetCustomTransport(s.TestSuiteCommon.client.Transport)
+
+	// Attempt to update the policy on the service account.
+	err = svcAdmClient.UpdateServiceAccount(ctx, cr.AccessKey,
+		madmin.UpdateServiceAccountReq{
+			NewPolicy: fullS3PolicyBytes,
+		})
+
+	if err == nil {
+		c.Fatalf("service account should not be able to update policy on itself")
+	} else if !strings.Contains(err.Error(), "Access Denied") {
+		c.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func (s *TestSuiteIAM) SetUpAccMgmtPlugin(c *check) {
+	ctx, cancel := context.WithTimeout(context.Background(), testDefaultTimeout)
+	defer cancel()
+
+	pluginEndpoint := env.Get("_MINIO_POLICY_PLUGIN_ENDPOINT", "")
+	if pluginEndpoint == "" {
+		c.Skip("_MINIO_POLICY_PLUGIN_ENDPOINT not given - skipping.")
+	}
+
+	configCmds := []string{
+		"policy_plugin",
+		"url=" + pluginEndpoint,
+	}
+
+	_, err := s.adm.SetConfigKV(ctx, strings.Join(configCmds, " "))
+	if err != nil {
+		c.Fatalf("unable to setup access management plugin for tests: %v", err)
+	}
+
+	s.RestartIAMSuite(c)
+}
+
+// TestIAM_AMPInternalIDPServerSuite - tests for access management plugin
+func TestIAM_AMPInternalIDPServerSuite(t *testing.T) {
+	for i, testCase := range iamTestSuites {
+		t.Run(
+			fmt.Sprintf("Test: %d, ServerType: %s", i+1, testCase.ServerTypeDescription),
+			func(t *testing.T) {
+				suite := testCase
+				c := &check{t, testCase.serverType}
+
+				suite.SetUpSuite(c)
+				defer suite.TearDownSuite(c)
+
+				suite.SetUpAccMgmtPlugin(c)
+
+				suite.TestAccMgmtPlugin(c)
+			},
+		)
+	}
+}
+
+// TestAccMgmtPlugin - this test assumes that the access-management-plugin is
+// the same as the example in `docs/iam/access-manager-plugin.go` -
+// specifically, it denies only `s3:Put*` operations on non-root accounts.
+func (s *TestSuiteIAM) TestAccMgmtPlugin(c *check) {
+	ctx, cancel := context.WithTimeout(context.Background(), testDefaultTimeout)
+	defer cancel()
+
+	// 0. Check that owner is able to make-bucket.
+	bucket := getRandomBucketName()
+	err := s.client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{})
+	if err != nil {
+		c.Fatalf("bucket creat error: %v", err)
+	}
+
+	// 1. Create a user.
+	accessKey, secretKey := mustGenerateCredentials(c)
+	err = s.adm.SetUser(ctx, accessKey, secretKey, madmin.AccountEnabled)
+	if err != nil {
+		c.Fatalf("Unable to set user: %v", err)
+	}
+
+	// 2. Check new user appears in listing
+	usersMap, err := s.adm.ListUsers(ctx)
+	if err != nil {
+		c.Fatalf("error listing: %v", err)
+	}
+	v, ok := usersMap[accessKey]
+	if !ok {
+		c.Fatalf("user not listed: %s", accessKey)
+	}
+	c.Assert(v.Status, madmin.AccountEnabled)
+
+	// 3. Check that user is able to make a bucket.
+	client := s.getUserClient(c, accessKey, secretKey, "")
+	err = client.MakeBucket(ctx, getRandomBucketName(), minio.MakeBucketOptions{})
+	if err != nil {
+		c.Fatalf("user not create bucket: %v", err)
+	}
+
+	// 3.1 check user has access to bucket
+	c.mustListObjects(ctx, client, bucket)
+
+	// 3.2 check that user cannot upload an object.
+	_, err = client.PutObject(ctx, bucket, "objectName", bytes.NewBuffer([]byte("some content")), 12, minio.PutObjectOptions{})
+	if err == nil {
+		c.Fatalf("user was able to upload unexpectedly")
+	}
+
+	// Create an madmin client with user creds
+	userAdmClient, err := madmin.NewWithOptions(s.endpoint, &madmin.Options{
+		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
+		Secure: s.secure,
+	})
+	if err != nil {
+		c.Fatalf("Err creating user admin client: %v", err)
+	}
+	userAdmClient.SetCustomTransport(s.TestSuiteCommon.client.Transport)
+
+	// Create svc acc
+	cr := c.mustCreateSvcAccount(ctx, accessKey, userAdmClient)
+
+	// 1. Check that svc account appears in listing
+	c.assertSvcAccAppearsInListing(ctx, userAdmClient, accessKey, cr.AccessKey)
+
+	// 2. Check that svc account info can be queried
+	c.assertSvcAccInfoQueryable(ctx, userAdmClient, accessKey, cr.AccessKey, false)
+
+	// 3. Check S3 access
+	c.assertSvcAccS3Access(ctx, s, cr, bucket)
+
+	// Check that session policies do not apply - as policy enforcement is
+	// delegated to plugin.
+	{
+		svcAK, svcSK := mustGenerateCredentials(c)
+
+		// This policy does not allow listing objects.
+		policyBytes := []byte(fmt.Sprintf(`{
+ "Version": "2012-10-17",
+ "Statement": [
+  {
+   "Effect": "Allow",
+   "Action": [
+    "s3:PutObject",
+    "s3:GetObject"
+   ],
+   "Resource": [
+    "arn:aws:s3:::%s/*"
+   ]
+  }
+ ]
+}`, bucket))
+		cr, err := userAdmClient.AddServiceAccount(ctx, madmin.AddServiceAccountReq{
+			Policy:     policyBytes,
+			TargetUser: accessKey,
+			AccessKey:  svcAK,
+			SecretKey:  svcSK,
+		})
+		if err != nil {
+			c.Fatalf("Unable to create svc acc: %v", err)
+		}
+		svcClient := s.getUserClient(c, cr.AccessKey, cr.SecretKey, "")
+		// Though the attached policy does not allow listing, it will be
+		// ignored because the plugin allows it.
+		c.mustListObjects(ctx, svcClient, bucket)
+	}
+
+	// 4. Check that service account's secret key and account status can be
+	// updated.
+	c.assertSvcAccSecretKeyAndStatusUpdate(ctx, s, userAdmClient, accessKey, bucket)
+
+	// 5. Check that service account can be deleted.
+	c.assertSvcAccDeletion(ctx, s, userAdmClient, accessKey, bucket)
+
+	// 6. Check that service account **can** be created for some other user.
+	// This is possible because the policy enforced in the plugin.
+	c.mustCreateSvcAccount(ctx, globalActiveCred.AccessKey, userAdmClient)
+}
+
 func (c *check) mustCreateIAMUser(ctx context.Context, admClnt *madmin.AdminClient) madmin.Credentials {
+	c.Helper()
 	randUser := mustGetUUID()
 	randPass := mustGetUUID()
 	err := admClnt.AddUser(ctx, randUser, randPass)
@@ -974,6 +1424,7 @@ func (c *check) mustCreateIAMUser(ctx context.Context, admClnt *madmin.AdminClie
 }
 
 func (c *check) mustGetIAMUserInfo(ctx context.Context, admClnt *madmin.AdminClient, accessKey string) madmin.UserInfo {
+	c.Helper()
 	ui, err := admClnt.GetUserInfo(ctx, accessKey)
 	if err != nil {
 		c.Fatalf("should be able to get user info: %v", err)
@@ -982,6 +1433,7 @@ func (c *check) mustGetIAMUserInfo(ctx context.Context, admClnt *madmin.AdminCli
 }
 
 func (c *check) mustNotCreateIAMUser(ctx context.Context, admClnt *madmin.AdminClient) {
+	c.Helper()
 	randUser := mustGetUUID()
 	randPass := mustGetUUID()
 	err := admClnt.AddUser(ctx, randUser, randPass)
@@ -991,6 +1443,7 @@ func (c *check) mustNotCreateIAMUser(ctx context.Context, admClnt *madmin.AdminC
 }
 
 func (c *check) mustCreateSvcAccount(ctx context.Context, tgtUser string, admClnt *madmin.AdminClient) madmin.Credentials {
+	c.Helper()
 	cr, err := admClnt.AddServiceAccount(ctx, madmin.AddServiceAccountReq{
 		TargetUser: tgtUser,
 	})
@@ -1001,6 +1454,7 @@ func (c *check) mustCreateSvcAccount(ctx context.Context, tgtUser string, admCln
 }
 
 func (c *check) mustNotCreateSvcAccount(ctx context.Context, tgtUser string, admClnt *madmin.AdminClient) {
+	c.Helper()
 	_, err := admClnt.AddServiceAccount(ctx, madmin.AddServiceAccountReq{
 		TargetUser: tgtUser,
 	})
@@ -1010,20 +1464,127 @@ func (c *check) mustNotCreateSvcAccount(ctx context.Context, tgtUser string, adm
 }
 
 func (c *check) mustNotListObjects(ctx context.Context, client *minio.Client, bucket string) {
+	c.Helper()
 	res := client.ListObjects(ctx, bucket, minio.ListObjectsOptions{})
 	v, ok := <-res
 	if !ok || v.Err == nil {
-		c.Fatalf("user was able to list unexpectedly!")
+		c.Fatalf("user was able to list unexpectedly! on %s", bucket)
+	}
+}
+
+func (c *check) mustPutObjectWithTags(ctx context.Context, client *minio.Client, bucket, object string) {
+	c.Helper()
+	_, err := client.PutObject(ctx, bucket, object, bytes.NewBuffer([]byte("stuff")), 5, minio.PutObjectOptions{
+		UserTags: map[string]string{
+			"security": "public",
+			"virus":    "true",
+		},
+	})
+	if err != nil {
+		c.Fatalf("user was unable to upload the object: %v", err)
+	}
+}
+
+func (c *check) mustGetObject(ctx context.Context, client *minio.Client, bucket, object string) {
+	c.Helper()
+
+	r, err := client.GetObject(ctx, bucket, object, minio.GetObjectOptions{})
+	if err != nil {
+		c.Fatalf("user was unable to download the object: %v", err)
+	}
+	defer r.Close()
+
+	_, err = io.Copy(io.Discard, r)
+	if err != nil {
+		c.Fatalf("user was unable to download the object: %v", err)
+	}
+}
+
+func (c *check) mustHeadObject(ctx context.Context, client *minio.Client, bucket, object string, tagCount int) {
+	c.Helper()
+
+	oinfo, err := client.StatObject(ctx, bucket, object, minio.StatObjectOptions{})
+	if err != nil {
+		c.Fatalf("user was unable to download the object: %v", err)
+	}
+
+	if oinfo.UserTagCount != tagCount {
+		c.Fatalf("expected tagCount: %d, got %d", tagCount, oinfo.UserTagCount)
 	}
 }
 
 func (c *check) mustListObjects(ctx context.Context, client *minio.Client, bucket string) {
+	c.Helper()
 	res := client.ListObjects(ctx, bucket, minio.ListObjectsOptions{})
 	v, ok := <-res
 	if ok && v.Err != nil {
-		msg := fmt.Sprintf("user was unable to list: %v", v.Err)
-		c.Fatalf(msg)
+		c.Fatalf("user was unable to list: %v", v.Err)
 	}
+}
+
+func (c *check) mustListBuckets(ctx context.Context, client *minio.Client) {
+	c.Helper()
+	_, err := client.ListBuckets(ctx)
+	if err != nil {
+		c.Fatalf("user was unable to list buckets: %v", err)
+	}
+}
+
+func (c *check) mustNotDelete(ctx context.Context, client *minio.Client, bucket string, vid string) {
+	c.Helper()
+
+	err := client.RemoveObject(ctx, bucket, "some-object", minio.RemoveObjectOptions{VersionID: vid})
+	if err == nil {
+		c.Fatalf("user must not be allowed to delete")
+	}
+
+	err = client.RemoveObject(ctx, bucket, "some-object", minio.RemoveObjectOptions{})
+	if err != nil {
+		c.Fatal("user must be able to create delete marker")
+	}
+}
+
+func (c *check) mustDownload(ctx context.Context, client *minio.Client, bucket string) {
+	c.Helper()
+	rd, err := client.GetObject(ctx, bucket, "some-object", minio.GetObjectOptions{})
+	if err != nil {
+		c.Fatalf("download did not succeed got %#v", err)
+	}
+	if _, err = io.Copy(io.Discard, rd); err != nil {
+		c.Fatalf("download did not succeed got %#v", err)
+	}
+}
+
+func (c *check) mustUploadReturnVersions(ctx context.Context, client *minio.Client, bucket string) []string {
+	c.Helper()
+	versions := []string{}
+	for i := 0; i < 5; i++ {
+		ui, err := client.PutObject(ctx, bucket, "some-object", bytes.NewBuffer([]byte("stuff")), 5, minio.PutObjectOptions{})
+		if err != nil {
+			c.Fatalf("upload did not succeed got %#v", err)
+		}
+		versions = append(versions, ui.VersionID)
+	}
+	return versions
+}
+
+func (c *check) mustUpload(ctx context.Context, client *minio.Client, bucket string) {
+	c.Helper()
+	_, err := client.PutObject(ctx, bucket, "some-object", bytes.NewBuffer([]byte("stuff")), 5, minio.PutObjectOptions{})
+	if err != nil {
+		c.Fatalf("upload did not succeed got %#v", err)
+	}
+}
+
+func (c *check) mustNotUpload(ctx context.Context, client *minio.Client, bucket string) {
+	c.Helper()
+	_, err := client.PutObject(ctx, bucket, "some-object", bytes.NewBuffer([]byte("stuff")), 5, minio.PutObjectOptions{})
+	if e, ok := err.(minio.ErrorResponse); ok {
+		if e.Code == "AccessDenied" {
+			return
+		}
+	}
+	c.Fatalf("upload did not get an AccessDenied error - got %#v instead", err)
 }
 
 func (c *check) assertSvcAccS3Access(ctx context.Context, s *TestSuiteIAM, cr madmin.Credentials, bucket string) {
@@ -1032,11 +1593,16 @@ func (c *check) assertSvcAccS3Access(ctx context.Context, s *TestSuiteIAM, cr ma
 }
 
 func (c *check) assertSvcAccAppearsInListing(ctx context.Context, madmClient *madmin.AdminClient, parentAK, svcAK string) {
+	c.Helper()
 	listResp, err := madmClient.ListServiceAccounts(ctx, parentAK)
 	if err != nil {
 		c.Fatalf("unable to list svc accounts: %v", err)
 	}
-	if !set.CreateStringSet(listResp.Accounts...).Contains(svcAK) {
+	var accessKeys []string
+	for _, item := range listResp.Accounts {
+		accessKeys = append(accessKeys, item.AccessKey)
+	}
+	if !set.CreateStringSet(accessKeys...).Contains(svcAK) {
 		c.Fatalf("service account did not appear in listing!")
 	}
 }
@@ -1057,6 +1623,7 @@ func (c *check) assertSvcAccInfoQueryable(ctx context.Context, madmClient *madmi
 // bucket. It creates a session policy that restricts listing on the bucket and
 // then enables it again in a session policy update call.
 func (c *check) assertSvcAccSessionPolicyUpdate(ctx context.Context, s *TestSuiteIAM, madmClient *madmin.AdminClient, accessKey, bucket string) {
+	c.Helper()
 	svcAK, svcSK := mustGenerateCredentials(c)
 
 	// This policy does not allow listing objects.
@@ -1097,7 +1664,7 @@ func (c *check) assertSvcAccSessionPolicyUpdate(ctx context.Context, s *TestSuit
     "s3:ListBucket"
    ],
    "Resource": [
-    "arn:aws:s3:::%s/*"
+    "arn:aws:s3:::%s"
    ]
   }
  ]
@@ -1112,6 +1679,7 @@ func (c *check) assertSvcAccSessionPolicyUpdate(ctx context.Context, s *TestSuit
 }
 
 func (c *check) assertSvcAccSecretKeyAndStatusUpdate(ctx context.Context, s *TestSuiteIAM, madmClient *madmin.AdminClient, accessKey, bucket string) {
+	c.Helper()
 	svcAK, svcSK := mustGenerateCredentials(c)
 	cr, err := madmClient.AddServiceAccount(ctx, madmin.AddServiceAccountReq{
 		TargetUser: accessKey,
@@ -1148,6 +1716,7 @@ func (c *check) assertSvcAccSecretKeyAndStatusUpdate(ctx context.Context, s *Tes
 }
 
 func (c *check) assertSvcAccDeletion(ctx context.Context, s *TestSuiteIAM, madmClient *madmin.AdminClient, accessKey, bucket string) {
+	c.Helper()
 	svcAK, svcSK := mustGenerateCredentials(c)
 	cr, err := madmClient.AddServiceAccount(ctx, madmin.AddServiceAccountReq{
 		TargetUser: accessKey,
@@ -1168,6 +1737,7 @@ func (c *check) assertSvcAccDeletion(ctx context.Context, s *TestSuiteIAM, madmC
 }
 
 func mustGenerateCredentials(c *check) (string, string) {
+	c.Helper()
 	ak, sk, err := auth.GenerateCredentials()
 	if err != nil {
 		c.Fatalf("unable to generate credentials: %v", err)

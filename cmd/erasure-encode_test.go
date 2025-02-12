@@ -24,7 +24,7 @@ import (
 	"io"
 	"testing"
 
-	humanize "github.com/dustin/go-humanize"
+	"github.com/dustin/go-humanize"
 )
 
 type badDisk struct{ StorageAPI }
@@ -41,11 +41,7 @@ func (a badDisk) ReadFileStream(ctx context.Context, volume, path string, offset
 	return nil, errFaultyDisk
 }
 
-func (a badDisk) UpdateBloomFilter(ctx context.Context, oldest, current uint64) (*bloomFilterResponse, error) {
-	return nil, errFaultyDisk
-}
-
-func (a badDisk) CreateFile(ctx context.Context, volume, path string, size int64, reader io.Reader) error {
+func (a badDisk) CreateFile(ctx context.Context, origvolume, volume, path string, size int64, reader io.Reader) error {
 	return errFaultyDisk
 }
 
@@ -87,21 +83,19 @@ var erasureEncodeTests = []struct {
 
 func TestErasureEncode(t *testing.T) {
 	for i, test := range erasureEncodeTests {
-		setup, err := newErasureTestSetup(test.dataBlocks, test.onDisks-test.dataBlocks, test.blocksize)
+		setup, err := newErasureTestSetup(t, test.dataBlocks, test.onDisks-test.dataBlocks, test.blocksize)
 		if err != nil {
 			t.Fatalf("Test %d: failed to create test setup: %v", i, err)
 		}
 		disks := setup.disks
 		erasure, err := NewErasure(context.Background(), test.dataBlocks, test.onDisks-test.dataBlocks, test.blocksize)
 		if err != nil {
-			setup.Remove()
 			t.Fatalf("Test %d: failed to create ErasureStorage: %v", i, err)
 		}
 		buffer := make([]byte, test.blocksize, 2*test.blocksize)
 
 		data := make([]byte, test.data)
 		if _, err = io.ReadFull(rand.Reader, data); err != nil {
-			setup.Remove()
 			t.Fatalf("Test %d: failed to generate random test data: %v", i, err)
 		}
 		writers := make([]io.Writer, len(disks))
@@ -109,7 +103,7 @@ func TestErasureEncode(t *testing.T) {
 			if disk == OfflineDisk {
 				continue
 			}
-			writers[i] = newBitrotWriter(disk, "testbucket", "object", erasure.ShardFileSize(int64(len(data[test.offset:]))), test.algorithm, erasure.ShardSize())
+			writers[i] = newBitrotWriter(disk, "", "testbucket", "object", erasure.ShardFileSize(int64(len(data[test.offset:]))), test.algorithm, erasure.ShardSize())
 		}
 		n, err := erasure.Encode(context.Background(), bytes.NewReader(data[test.offset:]), writers, buffer, erasure.dataBlocks+1)
 		closeBitrotWriters(writers)
@@ -133,7 +127,7 @@ func TestErasureEncode(t *testing.T) {
 				if disk == nil {
 					continue
 				}
-				writers[i] = newBitrotWriter(disk, "testbucket", "object2", erasure.ShardFileSize(int64(len(data[test.offset:]))), test.algorithm, erasure.ShardSize())
+				writers[i] = newBitrotWriter(disk, "", "testbucket", "object2", erasure.ShardFileSize(int64(len(data[test.offset:]))), test.algorithm, erasure.ShardSize())
 			}
 			for j := range disks[:test.offDisks] {
 				switch w := writers[j].(type) {
@@ -160,18 +154,16 @@ func TestErasureEncode(t *testing.T) {
 				}
 			}
 		}
-		setup.Remove()
 	}
 }
 
 // Benchmarks
 
 func benchmarkErasureEncode(data, parity, dataDown, parityDown int, size int64, b *testing.B) {
-	setup, err := newErasureTestSetup(data, parity, blockSizeV2)
+	setup, err := newErasureTestSetup(b, data, parity, blockSizeV2)
 	if err != nil {
 		b.Fatalf("failed to create test setup: %v", err)
 	}
-	defer setup.Remove()
 	erasure, err := NewErasure(context.Background(), data, parity, blockSizeV2)
 	if err != nil {
 		b.Fatalf("failed to create ErasureStorage: %v", err)
@@ -196,8 +188,11 @@ func benchmarkErasureEncode(data, parity, dataDown, parityDown int, size int64, 
 			if disk == OfflineDisk {
 				continue
 			}
-			disk.Delete(context.Background(), "testbucket", "object", false)
-			writers[i] = newBitrotWriter(disk, "testbucket", "object", erasure.ShardFileSize(size), DefaultBitrotAlgorithm, erasure.ShardSize())
+			disk.Delete(context.Background(), "testbucket", "object", DeleteOptions{
+				Recursive: false,
+				Immediate: false,
+			})
+			writers[i] = newBitrotWriter(disk, "", "testbucket", "object", erasure.ShardFileSize(size), DefaultBitrotAlgorithm, erasure.ShardSize())
 		}
 		_, err := erasure.Encode(context.Background(), bytes.NewReader(content), writers, buffer, erasure.dataBlocks+1)
 		closeBitrotWriters(writers)

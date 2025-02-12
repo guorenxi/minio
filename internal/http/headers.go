@@ -55,6 +55,12 @@ const (
 	IfMatch           = "If-Match"
 	IfNoneMatch       = "If-None-Match"
 
+	// Request tags used in GetObjectAttributes
+	Checksum     = "Checksum"
+	StorageClass = "StorageClass"
+	ObjectSize   = "ObjectSize"
+	ObjectParts  = "ObjectParts"
+
 	// S3 storage class
 	AmzStorageClass = "x-amz-storage-class"
 
@@ -89,7 +95,19 @@ const (
 	AmzObjectLockLegalHold        = "X-Amz-Object-Lock-Legal-Hold"
 	AmzObjectLockBypassGovernance = "X-Amz-Bypass-Governance-Retention"
 	AmzBucketReplicationStatus    = "X-Amz-Replication-Status"
-	AmzSnowballExtract            = "X-Amz-Meta-Snowball-Auto-Extract"
+
+	// AmzSnowballExtract will trigger unpacking of an archive content
+	AmzSnowballExtract = "X-Amz-Meta-Snowball-Auto-Extract"
+	// MinIOSnowballIgnoreDirs will skip creating empty directory objects.
+	MinIOSnowballIgnoreDirs = "X-Amz-Meta-Minio-Snowball-Ignore-Dirs"
+	// MinIOSnowballIgnoreErrors will ignore recoverable errors, typically single files failing to upload.
+	// An error will be printed to console instead.
+	MinIOSnowballIgnoreErrors = "X-Amz-Meta-Minio-Snowball-Ignore-Errors"
+	// MinIOSnowballPrefix will apply this prefix (plus / at end) to all extracted objects
+	MinIOSnowballPrefix = "X-Amz-Meta-Minio-Snowball-Prefix"
+
+	// Object lock enabled
+	AmzObjectLockEnabled = "x-amz-bucket-object-lock-enabled"
 
 	// Multipart parts count
 	AmzMpPartsCount = "x-amz-mp-parts-count"
@@ -100,7 +118,7 @@ const (
 	// Dummy putBucketACL
 	AmzACL = "x-amz-acl"
 
-	// Signature V4 related contants.
+	// Signature V4 related constants.
 	AmzContentSha256        = "X-Amz-Content-Sha256"
 	AmzDate                 = "X-Amz-Date"
 	AmzAlgorithm            = "X-Amz-Algorithm"
@@ -110,6 +128,12 @@ const (
 	AmzCredential           = "X-Amz-Credential"
 	AmzSecurityToken        = "X-Amz-Security-Token"
 	AmzDecodedContentLength = "X-Amz-Decoded-Content-Length"
+	AmzTrailer              = "X-Amz-Trailer"
+	AmzMaxParts             = "X-Amz-Max-Parts"
+	AmzPartNumberMarker     = "X-Amz-Part-Number-Marker"
+
+	// Constants used for GetObjectAttributes and GetObjectVersionAttributes
+	AmzObjectAttributes = "X-Amz-Object-Attributes"
 
 	AmzMetaUnencryptedContentLength = "X-Amz-Meta-X-Amz-Unencrypted-Content-Length"
 	AmzMetaUnencryptedContentMD5    = "X-Amz-Meta-X-Amz-Unencrypted-Content-Md5"
@@ -133,16 +157,39 @@ const (
 	AmzAccessKeyID = "AWSAccessKeyId"
 
 	// Response request id.
-	AmzRequestID = "x-amz-request-id"
+	AmzRequestID     = "x-amz-request-id"
+	AmzRequestHostID = "x-amz-id-2"
 
 	// Deployment id.
 	MinioDeploymentID = "x-minio-deployment-id"
 
+	// Peer call
+	MinIOPeerCall = "x-minio-from-peer"
+
 	// Server-Status
 	MinIOServerStatus = "x-minio-server-status"
 
+	// Content Checksums
+	AmzChecksumAlgo           = "x-amz-checksum-algorithm"
+	AmzChecksumCRC32          = "x-amz-checksum-crc32"
+	AmzChecksumCRC32C         = "x-amz-checksum-crc32c"
+	AmzChecksumSHA1           = "x-amz-checksum-sha1"
+	AmzChecksumSHA256         = "x-amz-checksum-sha256"
+	AmzChecksumCRC64NVME      = "x-amz-checksum-crc64nvme"
+	AmzChecksumMode           = "x-amz-checksum-mode"
+	AmzChecksumType           = "x-amz-checksum-type"
+	AmzChecksumTypeFullObject = "FULL_OBJECT"
+	AmzChecksumTypeComposite  = "COMPOSITE"
+
+	// Post Policy related
+	AmzMetaUUID = "X-Amz-Meta-Uuid"
+	AmzMetaName = "X-Amz-Meta-Name"
+
 	// Delete special flag to force delete a bucket or a prefix
 	MinIOForceDelete = "x-minio-force-delete"
+
+	// Create special flag to force create a bucket
+	MinIOForceCreate = "x-minio-force-create"
 
 	// Header indicates if the mtime should be preserved by client
 	MinIOSourceMTime = "x-minio-source-mtime"
@@ -152,6 +199,13 @@ const (
 
 	// Writes expected write quorum
 	MinIOWriteQuorum = "x-minio-write-quorum"
+
+	// Reads expected read quorum
+	MinIOReadQuorum = "x-minio-read-quorum"
+
+	// Indicates if we are using default storage class and there was problem loading config
+	// if this header is set to "true"
+	MinIOStorageClassDefaults = "x-minio-storage-class-defaults"
 
 	// Reports number of drives currently healing
 	MinIOHealingDrives = "x-minio-healing-drives"
@@ -170,17 +224,35 @@ const (
 	MinIOSourceProxyRequest = "X-Minio-Source-Proxy-Request"
 	// Header indicates that this request is a replication request to create a REPLICA
 	MinIOSourceReplicationRequest = "X-Minio-Source-Replication-Request"
+	// Header checks replication permissions without actually completing replication
+	MinIOSourceReplicationCheck = "X-Minio-Source-Replication-Check"
 	// Header indicates replication reset status.
 	MinIOReplicationResetStatus = "X-Minio-Replication-Reset-Status"
-
+	// Header indicating target cluster can receive delete marker replication requests because object has been replicated
+	MinIOTargetReplicationReady = "X-Minio-Replication-Ready"
+	// Header asking if cluster can receive delete marker replication request now.
+	MinIOCheckDMReplicationReady = "X-Minio-Check-Replication-Ready"
 	// Header indiicates last tag update time on source
 	MinIOSourceTaggingTimestamp = "X-Minio-Source-Replication-Tagging-Timestamp"
 	// Header indiicates last rtention update time on source
 	MinIOSourceObjectRetentionTimestamp = "X-Minio-Source-Replication-Retention-Timestamp"
 	// Header indiicates last rtention update time on source
 	MinIOSourceObjectLegalHoldTimestamp = "X-Minio-Source-Replication-LegalHold-Timestamp"
+	// Header indicates a Tag operation was performed on one/more peers successfully, though the
+	// current cluster does not have the object yet. This is in a site/bucket replication scenario.
+	MinIOTaggingProxied = "X-Minio-Tagging-Proxied"
+	// Header indicates the actual replicated object size
+	// In case of SSEC objects getting replicated (multipart) actual size would be needed at target
+	MinIOReplicationActualObjectSize = "X-Minio-Replication-Actual-Object-Size"
+
 	// predicted date/time of transition
-	MinIOTransition = "X-Minio-Transition"
+	MinIOTransition            = "X-Minio-Transition"
+	MinIOLifecycleCfgUpdatedAt = "X-Minio-LifecycleConfig-UpdatedAt"
+	// MinIOCompressed is returned when object is compressed
+	MinIOCompressed = "X-Minio-Compressed"
+
+	// SUBNET related
+	SubnetAPIKey = "x-subnet-api-key"
 )
 
 // Common http query params S3 API
@@ -190,4 +262,11 @@ const (
 	PartNumber = "partNumber"
 
 	UploadID = "uploadId"
+)
+
+// http headers sent to webhook targets
+const (
+	// Reports the version of MinIO server
+	MinIOVersion             = "x-minio-version"
+	WebhookEventPayloadCount = "x-minio-webhook-payload-count"
 )

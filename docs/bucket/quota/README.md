@@ -4,28 +4,27 @@
 
 Buckets can be configured to have `Hard` quota - it disallows writes to the bucket after configured quota limit is reached.
 
-> NOTE: Bucket quotas are not supported under gateway or standalone single disk deployments.
-
 ## Prerequisites
-- Install MinIO - [MinIO Quickstart Guide](https://docs.min.io/docs/minio-quickstart-guide).
-- [Use `mc` with MinIO Server](https://docs.min.io/docs/minio-client-quickstart-guide)
+
+- Install MinIO - [MinIO Quickstart Guide](https://min.io/docs/minio/linux/index.html#procedure).
+- [Use `mc` with MinIO Server](https://min.io/docs/minio/linux/reference/minio-mc.html#quickstart)
 
 ## Set bucket quota configuration
 
-### Set a hard quota of 1GB for a bucket `mybucket` on MinIO object storage:
+### Set a hard quota of 1GB for a bucket `mybucket` on MinIO object storage
 
 ```sh
-$ mc admin bucket quota myminio/mybucket --hard 1gb
+mc admin bucket quota myminio/mybucket --hard 1gb
 ```
 
 ### Verify the quota configured on `mybucket` on MinIO
 
 ```sh
-$ mc admin bucket quota myminio/mybucket
+mc admin bucket quota myminio/mybucket
 ```
 
 ### Clear bucket quota configuration for `mybucket` on MinIO
 
 ```sh
-$ mc admin bucket quota myminio/mybucket --clear
+mc admin bucket quota myminio/mybucket --clear
 ```
