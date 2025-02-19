@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -20,9 +20,10 @@ package ioutil
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
-	goioutil "io/ioutil"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -40,17 +41,37 @@ func (w *sleepWriter) Close() error {
 	return nil
 }
 
+func TestDeadlineWorker(t *testing.T) {
+	work := NewDeadlineWorker(500 * time.Millisecond)
+
+	err := work.Run(func() error {
+		time.Sleep(600 * time.Millisecond)
+		return nil
+	})
+	if err != context.DeadlineExceeded {
+		t.Error("DeadlineWorker shouldn't be successful - should return context.DeadlineExceeded")
+	}
+
+	err = work.Run(func() error {
+		time.Sleep(450 * time.Millisecond)
+		return nil
+	})
+	if err != nil {
+		t.Error("DeadlineWorker should succeed")
+	}
+}
+
 func TestDeadlineWriter(t *testing.T) {
 	w := NewDeadlineWriter(&sleepWriter{timeout: 500 * time.Millisecond}, 450*time.Millisecond)
 	_, err := w.Write([]byte("1"))
-	w.Close()
-	if err != context.Canceled {
-		t.Error("DeadlineWriter shouldn't be successful - should return context.Canceled")
+	if err != context.DeadlineExceeded {
+		t.Error("DeadlineWriter shouldn't be successful - should return context.DeadlineExceeded")
 	}
 	_, err = w.Write([]byte("1"))
-	if err != context.Canceled {
-		t.Error("DeadlineWriter shouldn't be successful - should return context.Canceled")
+	if err != context.DeadlineExceeded {
+		t.Error("DeadlineWriter shouldn't be successful - should return context.DeadlineExceeded")
 	}
+	w.Close()
 	w = NewDeadlineWriter(&sleepWriter{timeout: 100 * time.Millisecond}, 600*time.Millisecond)
 	n, err := w.Write([]byte("abcd"))
 	w.Close()
@@ -63,7 +84,7 @@ func TestDeadlineWriter(t *testing.T) {
 }
 
 func TestCloseOnWriter(t *testing.T) {
-	writer := WriteOnClose(goioutil.Discard)
+	writer := WriteOnClose(io.Discard)
 	if writer.HasWritten() {
 		t.Error("WriteOnCloser must not be marked as HasWritten")
 	}
@@ -72,7 +93,7 @@ func TestCloseOnWriter(t *testing.T) {
 		t.Error("WriteOnCloser must be marked as HasWritten")
 	}
 
-	writer = WriteOnClose(goioutil.Discard)
+	writer = WriteOnClose(io.Discard)
 	writer.Close()
 	if !writer.HasWritten() {
 		t.Error("WriteOnCloser must be marked as HasWritten")
@@ -81,7 +102,7 @@ func TestCloseOnWriter(t *testing.T) {
 
 // Test for AppendFile.
 func TestAppendFile(t *testing.T) {
-	f, err := goioutil.TempFile("", "")
+	f, err := os.CreateTemp(t.TempDir(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +111,7 @@ func TestAppendFile(t *testing.T) {
 	f.WriteString("aaaaaaaaaa")
 	f.Close()
 
-	f, err = goioutil.TempFile("", "")
+	f, err = os.CreateTemp(t.TempDir(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +124,7 @@ func TestAppendFile(t *testing.T) {
 		t.Error(err)
 	}
 
-	b, err := goioutil.ReadFile(name1)
+	b, err := os.ReadFile(name1)
 	if err != nil {
 		t.Error(err)
 	}
@@ -130,7 +151,7 @@ func TestSkipReader(t *testing.T) {
 	}
 	for i, testCase := range testCases {
 		r := NewSkipReader(testCase.src, testCase.skipLen)
-		b, err := goioutil.ReadAll(r)
+		b, err := io.ReadAll(r)
 		if err != nil {
 			t.Errorf("Case %d: Unexpected err %v", i, err)
 		}
@@ -141,7 +162,7 @@ func TestSkipReader(t *testing.T) {
 }
 
 func TestSameFile(t *testing.T) {
-	f, err := goioutil.TempFile("", "")
+	f, err := os.CreateTemp(t.TempDir(), "")
 	if err != nil {
 		t.Errorf("Error creating tmp file: %v", err)
 	}
@@ -159,7 +180,7 @@ func TestSameFile(t *testing.T) {
 	if !SameFile(fi1, fi2) {
 		t.Fatal("Expected the files to be same")
 	}
-	if err = goioutil.WriteFile(tmpFile, []byte("aaa"), 0o644); err != nil {
+	if err = os.WriteFile(tmpFile, []byte("aaa"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	fi2, err = os.Stat(tmpFile)
@@ -168,5 +189,38 @@ func TestSameFile(t *testing.T) {
 	}
 	if SameFile(fi1, fi2) {
 		t.Fatal("Expected the files not to be same")
+	}
+}
+
+func TestCopyAligned(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "")
+	if err != nil {
+		t.Errorf("Error creating tmp file: %v", err)
+	}
+	defer f.Close()
+	defer os.Remove(f.Name())
+
+	r := strings.NewReader("hello world")
+
+	bufp := ODirectPoolSmall.Get()
+	defer ODirectPoolSmall.Put(bufp)
+
+	written, err := CopyAligned(f, io.LimitReader(r, 5), *bufp, r.Size(), f)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("Expected io.ErrUnexpectedEOF, but got %v", err)
+	}
+	if written != 5 {
+		t.Errorf("Expected written to be '5', but got %v", written)
+	}
+
+	f.Seek(0, io.SeekStart)
+	r.Seek(0, io.SeekStart)
+
+	written, err = CopyAligned(f, r, *bufp, r.Size(), f)
+	if !errors.Is(err, nil) {
+		t.Errorf("Expected nil, but got %v", err)
+	}
+	if written != r.Size() {
+		t.Errorf("Expected written to be '%v', but got %v", r.Size(), written)
 	}
 }

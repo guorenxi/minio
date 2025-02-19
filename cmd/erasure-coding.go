@@ -41,7 +41,7 @@ type Erasure struct {
 // NewErasure creates a new ErasureStorage.
 func NewErasure(ctx context.Context, dataBlocks, parityBlocks int, blockSize int64) (e Erasure, err error) {
 	// Check the parameters for sanity now.
-	if dataBlocks <= 0 || parityBlocks <= 0 {
+	if dataBlocks <= 0 || parityBlocks < 0 {
 		return e, reedsolomon.ErrInvShardNum
 	}
 
@@ -80,11 +80,9 @@ func (e *Erasure) EncodeData(ctx context.Context, data []byte) ([][]byte, error)
 	}
 	encoded, err := e.encoder().Split(data)
 	if err != nil {
-		logger.LogIf(ctx, err)
 		return nil, err
 	}
 	if err = e.encoder().Encode(encoded); err != nil {
-		logger.LogIf(ctx, err)
 		return nil, err
 	}
 	return encoded, nil
@@ -111,11 +109,7 @@ func (e *Erasure) DecodeDataBlocks(data [][]byte) error {
 // DecodeDataAndParityBlocks decodes the given erasure-coded data and verifies it.
 // It returns an error if the decoding failed.
 func (e *Erasure) DecodeDataAndParityBlocks(ctx context.Context, data [][]byte) error {
-	if err := e.encoder().Reconstruct(data); err != nil {
-		logger.LogIf(ctx, err)
-		return err
-	}
-	return nil
+	return e.encoder().Reconstruct(data)
 }
 
 // ShardSize - returns actual shared size from erasure blockSize.
@@ -207,7 +201,6 @@ func erasureSelfTest() {
 				ok = false
 				continue
 			}
-
 		}
 	}
 	if !ok {

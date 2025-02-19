@@ -109,8 +109,7 @@ func parseCredentialHeader(credElement string, region string, stype serviceType)
 		return ch, ErrAuthorizationHeaderMalformed
 	}
 	if credElements[2] != string(stype) {
-		switch stype {
-		case serviceSTS:
+		if stype == serviceSTS {
 			return ch, ErrInvalidServiceSTS
 		}
 		return ch, ErrInvalidServiceS3
@@ -162,7 +161,7 @@ type signValues struct {
 	Signature     string
 }
 
-// preSignValues data type represents structued form of AWS Signature V4 query string.
+// preSignValues data type represents structured form of AWS Signature V4 query string.
 type preSignValues struct {
 	signValues
 	Date    time.Time
@@ -171,12 +170,12 @@ type preSignValues struct {
 
 // Parses signature version '4' query string of the following form.
 //
-//   querystring = X-Amz-Algorithm=algorithm
-//   querystring += &X-Amz-Credential= urlencode(accessKey + '/' + credential_scope)
-//   querystring += &X-Amz-Date=date
-//   querystring += &X-Amz-Expires=timeout interval
-//   querystring += &X-Amz-SignedHeaders=signed_headers
-//   querystring += &X-Amz-Signature=signature
+//	querystring = X-Amz-Algorithm=algorithm
+//	querystring += &X-Amz-Credential= urlencode(accessKey + '/' + credential_scope)
+//	querystring += &X-Amz-Date=date
+//	querystring += &X-Amz-Expires=timeout interval
+//	querystring += &X-Amz-SignedHeaders=signed_headers
+//	querystring += &X-Amz-Signature=signature
 //
 // verifies if any of the necessary query params are missing in the presigned request.
 func doesV4PresignParamsExist(query url.Values) APIErrorCode {
@@ -233,6 +232,10 @@ func parsePreSignV4(query url.Values, region string, stype serviceType) (psv pre
 		return psv, ErrMaximumExpires
 	}
 
+	if preSignV4Values.Date.IsZero() || preSignV4Values.Date.Equal(timeSentinel) {
+		return psv, ErrMalformedPresignedDate
+	}
+
 	// Save signed headers.
 	preSignV4Values.SignedHeaders, aec = parseSignedHeader("SignedHeaders=" + query.Get(xhttp.AmzSignedHeaders))
 	if aec != ErrNone {
@@ -245,15 +248,14 @@ func parsePreSignV4(query url.Values, region string, stype serviceType) (psv pre
 		return psv, aec
 	}
 
-	// Return structed form of signature query string.
+	// Return structured form of signature query string.
 	return preSignV4Values, ErrNone
 }
 
 // Parses signature version '4' header of the following form.
 //
-//    Authorization: algorithm Credential=accessKeyID/credScope, \
-//            SignedHeaders=signedHeaders, Signature=signature
-//
+//	Authorization: algorithm Credential=accessKeyID/credScope, \
+//	        SignedHeaders=signedHeaders, Signature=signature
 func parseSignV4(v4Auth string, region string, stype serviceType) (sv signValues, aec APIErrorCode) {
 	// credElement is fetched first to skip replacing the space in access key.
 	credElement := strings.TrimPrefix(strings.Split(strings.TrimSpace(v4Auth), ",")[0], signV4Algorithm)
@@ -281,7 +283,7 @@ func parseSignV4(v4Auth string, region string, stype serviceType) (sv signValues
 	signV4Values := signValues{}
 
 	var s3Err APIErrorCode
-	// Save credentail values.
+	// Save credential values.
 	signV4Values.Credential, s3Err = parseCredentialHeader(strings.TrimSpace(credElement), region, stype)
 	if s3Err != ErrNone {
 		return sv, s3Err

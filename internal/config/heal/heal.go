@@ -18,25 +18,28 @@
 package heal
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/minio/madmin-go"
 	"github.com/minio/minio/internal/config"
-	"github.com/minio/pkg/env"
+	"github.com/minio/pkg/v3/env"
 )
 
 // Compression environment variables
 const (
-	Bitrot  = "bitrotscan"
-	Sleep   = "max_sleep"
-	IOCount = "max_io"
+	Bitrot       = "bitrotscan"
+	Sleep        = "max_sleep"
+	IOCount      = "max_io"
+	DriveWorkers = "drive_workers"
 
-	EnvBitrot  = "MINIO_HEAL_BITROTSCAN"
-	EnvSleep   = "MINIO_HEAL_MAX_SLEEP"
-	EnvIOCount = "MINIO_HEAL_MAX_IO"
+	EnvBitrot       = "MINIO_HEAL_BITROTSCAN"
+	EnvSleep        = "MINIO_HEAL_MAX_SLEEP"
+	EnvIOCount      = "MINIO_HEAL_MAX_IO"
+	EnvDriveWorkers = "MINIO_HEAL_DRIVE_WORKERS"
 )
 
 var configMutex sync.RWMutex
@@ -44,55 +47,43 @@ var configMutex sync.RWMutex
 // Config represents the heal settings.
 type Config struct {
 	// Bitrot will perform bitrot scan on local disk when checking objects.
-	Bitrot bool `json:"bitrotscan"`
+	Bitrot string `json:"bitrotscan"`
+
 	// maximum sleep duration between objects to slow down heal operation.
 	Sleep   time.Duration `json:"sleep"`
 	IOCount int           `json:"iocount"`
+
+	DriveWorkers int `json:"drive_workers"`
+
+	// Cached value from Bitrot field
+	cache struct {
+		// -1: bitrot enabled, 0: bitrot disabled, > 0: bitrot cycle
+		bitrotCycle time.Duration
+	}
 }
 
-// ScanMode returns configured scan mode
-func (opts Config) ScanMode() madmin.HealScanMode {
+// BitrotScanCycle returns the configured cycle for the scanner healing
+// - '-1' for not enabled
+// - '0' for continuous bitrot scanning
+// - '> 0' interval duration between cycles
+func (opts Config) BitrotScanCycle() (d time.Duration) {
 	configMutex.RLock()
 	defer configMutex.RUnlock()
-	if opts.Bitrot {
-		return madmin.HealDeepScan
-	}
-	return madmin.HealNormalScan
+	return opts.cache.bitrotCycle
 }
 
-// Wait waits for IOCount to go down or max sleep to elapse before returning.
-// usually used in healing paths to wait for specified amount of time to
-// throttle healing.
-func (opts Config) Wait(currentIO func() int, systemIO func() int) {
+// Clone safely the heal configuration
+func (opts Config) Clone() (int, time.Duration, string) {
 	configMutex.RLock()
-	maxIO, maxWait := opts.IOCount, opts.Sleep
-	configMutex.RUnlock()
+	defer configMutex.RUnlock()
+	return opts.IOCount, opts.Sleep, opts.Bitrot
+}
 
-	// No need to wait run at full speed.
-	if maxIO <= 0 {
-		return
-	}
-
-	// At max 10 attempts to wait with 100 millisecond interval before proceeding
-	waitTick := 100 * time.Millisecond
-
-	tmpMaxWait := maxWait
-
-	if currentIO != nil {
-		for currentIO() >= maxIO+systemIO() {
-			if tmpMaxWait > 0 {
-				if tmpMaxWait < waitTick {
-					time.Sleep(tmpMaxWait)
-				} else {
-					time.Sleep(waitTick)
-				}
-				tmpMaxWait -= waitTick
-			}
-			if tmpMaxWait <= 0 {
-				return
-			}
-		}
-	}
+// GetWorkers returns the number of workers, -1 is none configured
+func (opts Config) GetWorkers() int {
+	configMutex.RLock()
+	defer configMutex.RUnlock()
+	return opts.DriveWorkers
 }
 
 // Update updates opts with nopts
@@ -103,57 +94,75 @@ func (opts *Config) Update(nopts Config) {
 	opts.Bitrot = nopts.Bitrot
 	opts.IOCount = nopts.IOCount
 	opts.Sleep = nopts.Sleep
+	opts.DriveWorkers = nopts.DriveWorkers
+
+	opts.cache.bitrotCycle, _ = parseBitrotConfig(nopts.Bitrot)
 }
 
-var (
-	// DefaultKVS - default KV config for heal settings
-	DefaultKVS = config.KVS{
-		config.KV{
-			Key:   Bitrot,
-			Value: config.EnableOff,
-		},
-		config.KV{
-			Key:   Sleep,
-			Value: "1s",
-		},
-		config.KV{
-			Key:   IOCount,
-			Value: "100",
-		},
+// DefaultKVS - default KV config for heal settings
+var DefaultKVS = config.KVS{
+	config.KV{
+		Key:   Bitrot,
+		Value: config.EnableOff,
+	},
+	config.KV{
+		Key:   Sleep,
+		Value: "250ms",
+	},
+	config.KV{
+		Key:   IOCount,
+		Value: "100",
+	},
+	config.KV{
+		Key:   DriveWorkers,
+		Value: "",
+	},
+}
+
+const minimumBitrotCycleInMonths = 1
+
+func parseBitrotConfig(s string) (time.Duration, error) {
+	// Try to parse as a boolean
+	enabled, err := config.ParseBool(s)
+	if err == nil {
+		switch enabled {
+		case true:
+			return 0, nil
+		case false:
+			return -1, nil
+		}
 	}
 
-	// Help provides help for config values
-	Help = config.HelpKVS{
-		config.HelpKV{
-			Key:         Bitrot,
-			Description: `perform bitrot scan on disks when checking objects during scanner`,
-			Optional:    true,
-			Type:        "on|off",
-		},
-		config.HelpKV{
-			Key:         Sleep,
-			Description: `maximum sleep duration between objects to slow down heal operation. eg. 2s`,
-			Optional:    true,
-			Type:        "duration",
-		},
-		config.HelpKV{
-			Key:         IOCount,
-			Description: `maximum IO requests allowed between objects to slow down heal operation. eg. 3`,
-			Optional:    true,
-			Type:        "int",
-		},
+	// Try to parse as a number of months
+	if !strings.HasSuffix(s, "m") {
+		return -1, errors.New("unknown format")
 	}
-)
+
+	months, err := strconv.Atoi(strings.TrimSuffix(s, "m"))
+	if err != nil {
+		return -1, err
+	}
+
+	if months < minimumBitrotCycleInMonths {
+		return -1, fmt.Errorf("minimum bitrot cycle is %d month(s)", minimumBitrotCycleInMonths)
+	}
+
+	return time.Duration(months) * 30 * 24 * time.Hour, nil
+}
 
 // LookupConfig - lookup config and override with valid environment settings if any.
 func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 	if err = config.CheckValidKeys(config.HealSubSys, kvs, DefaultKVS); err != nil {
 		return cfg, err
 	}
-	cfg.Bitrot, err = config.ParseBool(env.Get(EnvBitrot, kvs.GetWithDefault(Bitrot, DefaultKVS)))
-	if err != nil {
+
+	bitrot := env.Get(EnvBitrot, kvs.GetWithDefault(Bitrot, DefaultKVS))
+	if _, err = parseBitrotConfig(bitrot); err != nil {
 		return cfg, fmt.Errorf("'heal:bitrotscan' value invalid: %w", err)
 	}
+
+	cfg.Bitrot = bitrot
+
 	cfg.Sleep, err = time.ParseDuration(env.Get(EnvSleep, kvs.GetWithDefault(Sleep, DefaultKVS)))
 	if err != nil {
 		return cfg, fmt.Errorf("'heal:max_sleep' value invalid: %w", err)
@@ -162,5 +171,18 @@ func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 	if err != nil {
 		return cfg, fmt.Errorf("'heal:max_io' value invalid: %w", err)
 	}
+	if ws := env.Get(EnvDriveWorkers, kvs.GetWithDefault(DriveWorkers, DefaultKVS)); ws != "" {
+		w, err := strconv.Atoi(ws)
+		if err != nil {
+			return cfg, fmt.Errorf("'heal:drive_workers' value invalid: %w", err)
+		}
+		if w < 1 {
+			return cfg, fmt.Errorf("'heal:drive_workers' value invalid: zero or negative integer unsupported")
+		}
+		cfg.DriveWorkers = w
+	} else {
+		cfg.DriveWorkers = -1
+	}
+
 	return cfg, nil
 }

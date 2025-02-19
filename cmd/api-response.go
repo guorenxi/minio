@@ -29,19 +29,21 @@ import (
 	"strings"
 	"time"
 
+	"github.com/minio/minio/internal/amztime"
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/handlers"
+	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/pkg/v3/policy"
+	xxml "github.com/minio/xxml"
 )
 
 const (
-	// RFC3339 a subset of the ISO8601 timestamp format. e.g 2014-04-29T18:30:38Z
-	iso8601TimeFormat = "2006-01-02T15:04:05.000Z" // Reply date format with nanosecond precision.
-	maxObjectList     = 1000                       // Limit number of objects in a listObjectsResponse/listObjectsVersionsResponse.
-	maxDeleteList     = 1000                       // Limit number of objects deleted in a delete call.
-	maxUploadsList    = 10000                      // Limit number of uploads in a listUploadsResponse.
-	maxPartsList      = 10000                      // Limit number of parts in a listPartsResponse.
+	maxObjectList  = 1000  // Limit number of objects in a listObjectsResponse/listObjectsVersionsResponse.
+	maxDeleteList  = 1000  // Limit number of objects deleted in a delete call.
+	maxUploadsList = 10000 // Limit number of uploads in a listUploadsResponse.
+	maxPartsList   = 10000 // Limit number of parts in a listPartsResponse.
 )
 
 // LocationResponse - format for location response.
@@ -83,7 +85,7 @@ type ListVersionsResponse struct {
 	VersionIDMarker string `xml:"VersionIdMarker"`
 
 	MaxKeys   int
-	Delimiter string
+	Delimiter string `xml:"Delimiter,omitempty"`
 	// A flag that indicates whether or not ListObjects returned all of the results
 	// that satisfied the search criteria.
 	IsTruncated bool
@@ -113,7 +115,7 @@ type ListObjectsResponse struct {
 	NextMarker string `xml:"NextMarker,omitempty"`
 
 	MaxKeys   int
-	Delimiter string
+	Delimiter string `xml:"Delimiter,omitempty"`
 	// A flag that indicates whether or not ListObjects returned all of the results
 	// that satisfied the search criteria.
 	IsTruncated bool
@@ -144,7 +146,7 @@ type ListObjectsV2Response struct {
 
 	KeyCount  int
 	MaxKeys   int
-	Delimiter string
+	Delimiter string `xml:"Delimiter,omitempty"`
 	// A flag that indicates whether or not ListObjects returned all of the results
 	// that satisfied the search criteria.
 	IsTruncated bool
@@ -162,6 +164,13 @@ type Part struct {
 	LastModified string
 	ETag         string
 	Size         int64
+
+	// Checksum values
+	ChecksumCRC32     string `xml:"ChecksumCRC32,omitempty"`
+	ChecksumCRC32C    string `xml:"ChecksumCRC32C,omitempty"`
+	ChecksumSHA1      string `xml:"ChecksumSHA1,omitempty"`
+	ChecksumSHA256    string `xml:"ChecksumSHA256,omitempty"`
+	ChecksumCRC64NVME string `xml:",omitempty"`
 }
 
 // ListPartsResponse - format for list parts response.
@@ -183,6 +192,9 @@ type ListPartsResponse struct {
 	MaxParts             int
 	IsTruncated          bool
 
+	ChecksumAlgorithm string
+	ChecksumType      string
+
 	// List of parts.
 	Parts []Part `xml:"Part"`
 }
@@ -196,7 +208,7 @@ type ListMultipartUploadsResponse struct {
 	UploadIDMarker     string `xml:"UploadIdMarker"`
 	NextKeyMarker      string
 	NextUploadIDMarker string `xml:"NextUploadIdMarker"`
-	Delimiter          string
+	Delimiter          string `xml:"Delimiter,omitempty"`
 	Prefix             string
 	EncodingType       string `xml:"EncodingType,omitempty"`
 	MaxUploads         int
@@ -252,45 +264,95 @@ type ObjectVersion struct {
 }
 
 // MarshalXML - marshal ObjectVersion
-func (o ObjectVersion) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+func (o ObjectVersion) MarshalXML(e *xxml.Encoder, start xxml.StartElement) error {
 	if o.isDeleteMarker {
 		start.Name.Local = "DeleteMarker"
 	} else {
 		start.Name.Local = "Version"
 	}
-
 	type objectVersionWrapper ObjectVersion
 	return e.EncodeElement(objectVersionWrapper(o), start)
 }
 
-// StringMap is a map[string]string
-type StringMap map[string]string
+// DeleteMarkerVersion container for delete marker metadata
+type DeleteMarkerVersion struct {
+	Key          string
+	LastModified string // time string of format "2006-01-02T15:04:05.000Z"
+
+	// Owner of the object.
+	Owner Owner
+
+	IsLatest  bool
+	VersionID string `xml:"VersionId"`
+}
+
+// Metadata metadata items implemented to ensure XML marshaling works.
+type Metadata struct {
+	Items []struct {
+		Key   string
+		Value string
+	}
+}
+
+// Set add items, duplicate items get replaced.
+func (s *Metadata) Set(k, v string) {
+	for i, item := range s.Items {
+		if item.Key == k {
+			s.Items[i] = struct {
+				Key   string
+				Value string
+			}{
+				Key:   k,
+				Value: v,
+			}
+			return
+		}
+	}
+	s.Items = append(s.Items, struct {
+		Key   string
+		Value string
+	}{
+		Key:   k,
+		Value: v,
+	})
+}
+
+type xmlKeyEntry struct {
+	XMLName xxml.Name
+	Value   string `xml:",chardata"`
+}
 
 // MarshalXML - StringMap marshals into XML.
-func (s StringMap) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	tokens := []xml.Token{start}
-
-	for key, value := range s {
-		t := xml.StartElement{}
-		t.Name = xml.Name{
-			Space: "",
-			Local: key,
-		}
-		tokens = append(tokens, t, xml.CharData(value), xml.EndElement{Name: t.Name})
+func (s *Metadata) MarshalXML(e *xxml.Encoder, start xxml.StartElement) error {
+	if s == nil {
+		return nil
 	}
 
-	tokens = append(tokens, xml.EndElement{
-		Name: start.Name,
-	})
+	if len(s.Items) == 0 {
+		return nil
+	}
 
-	for _, t := range tokens {
-		if err := e.EncodeToken(t); err != nil {
+	if err := e.EncodeToken(start); err != nil {
+		return err
+	}
+
+	for _, item := range s.Items {
+		if err := e.Encode(xmlKeyEntry{
+			XMLName: xxml.Name{Local: item.Key},
+			Value:   item.Value,
+		}); err != nil {
 			return err
 		}
 	}
 
-	// flush to ensure tokens are written
-	return e.Flush()
+	return e.EncodeToken(start.End())
+}
+
+// ObjectInternalInfo contains some internal information about a given
+// object, it will printed in listing calls with enabled metadata.
+type ObjectInternalInfo struct {
+	K int // Data blocks
+	M int // Parity blocks
 }
 
 // Object container for object metadata
@@ -301,13 +363,16 @@ type Object struct {
 	Size         int64
 
 	// Owner of the object.
-	Owner Owner
+	Owner *Owner `xml:"Owner,omitempty"`
 
 	// The class of storage used to store the object.
 	StorageClass string
 
 	// UserMetadata user-defined metadata
-	UserMetadata StringMap `xml:"UserMetadata,omitempty"`
+	UserMetadata *Metadata `xml:"UserMetadata,omitempty"`
+	UserTags     string    `xml:"UserTags,omitempty"`
+
+	Internal *ObjectInternalInfo `xml:"Internal,omitempty"`
 }
 
 // CopyObjectResponse container returns ETag and LastModified of the successfully copied object
@@ -350,6 +415,12 @@ type CompleteMultipartUploadResponse struct {
 	Bucket   string
 	Key      string
 	ETag     string
+
+	ChecksumCRC32     string `xml:"ChecksumCRC32,omitempty"`
+	ChecksumCRC32C    string `xml:"ChecksumCRC32C,omitempty"`
+	ChecksumSHA1      string `xml:"ChecksumSHA1,omitempty"`
+	ChecksumSHA256    string `xml:"ChecksumSHA256,omitempty"`
+	ChecksumCRC64NVME string `xml:",omitempty"`
 }
 
 // DeleteError structure.
@@ -425,7 +496,7 @@ func generateListBucketsResponse(buckets []BucketInfo) ListBucketsResponse {
 	for _, bucket := range buckets {
 		listbuckets = append(listbuckets, Bucket{
 			Name:         bucket.Name,
-			CreationDate: bucket.Created.UTC().Format(iso8601TimeFormat),
+			CreationDate: amztime.ISO8601Format(bucket.Created.UTC()),
 		})
 	}
 
@@ -435,30 +506,100 @@ func generateListBucketsResponse(buckets []BucketInfo) ListBucketsResponse {
 	return data
 }
 
+func cleanReservedKeys(metadata map[string]string) map[string]string {
+	m := cloneMSS(metadata)
+
+	switch kind, _ := crypto.IsEncrypted(metadata); kind {
+	case crypto.S3:
+		m[xhttp.AmzServerSideEncryption] = xhttp.AmzEncryptionAES
+	case crypto.S3KMS:
+		m[xhttp.AmzServerSideEncryption] = xhttp.AmzEncryptionKMS
+		m[xhttp.AmzServerSideEncryptionKmsID] = kmsKeyIDFromMetadata(metadata)
+		if kmsCtx, ok := metadata[crypto.MetaContext]; ok {
+			m[xhttp.AmzServerSideEncryptionKmsContext] = kmsCtx
+		}
+	case crypto.SSEC:
+		m[xhttp.AmzServerSideEncryptionCustomerAlgorithm] = xhttp.AmzEncryptionAES
+	}
+
+	var toRemove []string
+	for k := range cleanMinioInternalMetadataKeys(m) {
+		if stringsHasPrefixFold(k, ReservedMetadataPrefixLower) {
+			// Do not need to send any internal metadata
+			// values to client.
+			toRemove = append(toRemove, k)
+			continue
+		}
+
+		// https://github.com/google/security-research/security/advisories/GHSA-76wf-9vgp-pj7w
+		if equals(k, xhttp.AmzMetaUnencryptedContentLength, xhttp.AmzMetaUnencryptedContentMD5) {
+			toRemove = append(toRemove, k)
+			continue
+		}
+	}
+
+	for _, k := range toRemove {
+		delete(m, k)
+		delete(m, strings.ToLower(k))
+	}
+
+	return m
+}
+
 // generates an ListBucketVersions response for the said bucket with other enumerated options.
-func generateListVersionsResponse(bucket, prefix, marker, versionIDMarker, delimiter, encodingType string, maxKeys int, resp ListObjectVersionsInfo) ListVersionsResponse {
+func generateListVersionsResponse(ctx context.Context, bucket, prefix, marker, versionIDMarker, delimiter, encodingType string, maxKeys int, resp ListObjectVersionsInfo, metadata metaCheckFn) ListVersionsResponse {
 	versions := make([]ObjectVersion, 0, len(resp.Objects))
-	owner := Owner{
+
+	owner := &Owner{
 		ID:          globalMinioDefaultOwnerID,
 		DisplayName: "minio",
 	}
 	data := ListVersionsResponse{}
+	var lastObjMetaName string
+	var tagErr, metaErr APIErrorCode = -1, -1
 
 	for _, object := range resp.Objects {
-		content := ObjectVersion{}
 		if object.Name == "" {
 			continue
 		}
+		// Cache checks for the same object
+		if metadata != nil && lastObjMetaName != object.Name {
+			tagErr = metadata(object.Name, policy.GetObjectTaggingAction)
+			metaErr = metadata(object.Name, policy.GetObjectAction)
+			lastObjMetaName = object.Name
+		}
+		content := ObjectVersion{}
 		content.Key = s3EncodeName(object.Name, encodingType)
-		content.LastModified = object.ModTime.UTC().Format(iso8601TimeFormat)
+		content.LastModified = amztime.ISO8601Format(object.ModTime.UTC())
 		if object.ETag != "" {
 			content.ETag = "\"" + object.ETag + "\""
 		}
 		content.Size = object.Size
 		if object.StorageClass != "" {
-			content.StorageClass = object.StorageClass
+			content.StorageClass = filterStorageClass(ctx, object.StorageClass)
 		} else {
 			content.StorageClass = globalMinioDefaultStorageClass
+		}
+		if tagErr == ErrNone {
+			content.UserTags = object.UserTags
+		}
+		if metaErr == ErrNone {
+			content.UserMetadata = &Metadata{}
+			switch kind, _ := crypto.IsEncrypted(object.UserDefined); kind {
+			case crypto.S3:
+				content.UserMetadata.Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionAES)
+			case crypto.S3KMS:
+				content.UserMetadata.Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionKMS)
+			case crypto.SSEC:
+				content.UserMetadata.Set(xhttp.AmzServerSideEncryptionCustomerAlgorithm, xhttp.AmzEncryptionAES)
+			}
+			for k, v := range cleanReservedKeys(object.UserDefined) {
+				content.UserMetadata.Set(k, v)
+			}
+			content.Internal = &ObjectInternalInfo{
+				K: object.DataBlocks,
+				M: object.ParityBlocks,
+			}
 		}
 		content.Owner = owner
 		content.VersionID = object.VersionID
@@ -494,9 +635,9 @@ func generateListVersionsResponse(bucket, prefix, marker, versionIDMarker, delim
 }
 
 // generates an ListObjectsV1 response for the said bucket with other enumerated options.
-func generateListObjectsV1Response(bucket, prefix, marker, delimiter, encodingType string, maxKeys int, resp ListObjectsInfo) ListObjectsResponse {
+func generateListObjectsV1Response(ctx context.Context, bucket, prefix, marker, delimiter, encodingType string, maxKeys int, resp ListObjectsInfo) ListObjectsResponse {
 	contents := make([]Object, 0, len(resp.Objects))
-	owner := Owner{
+	owner := &Owner{
 		ID:          globalMinioDefaultOwnerID,
 		DisplayName: "minio",
 	}
@@ -508,13 +649,13 @@ func generateListObjectsV1Response(bucket, prefix, marker, delimiter, encodingTy
 			continue
 		}
 		content.Key = s3EncodeName(object.Name, encodingType)
-		content.LastModified = object.ModTime.UTC().Format(iso8601TimeFormat)
+		content.LastModified = amztime.ISO8601Format(object.ModTime.UTC())
 		if object.ETag != "" {
 			content.ETag = "\"" + object.ETag + "\""
 		}
 		content.Size = object.Size
 		if object.StorageClass != "" {
-			content.StorageClass = object.StorageClass
+			content.StorageClass = filterStorageClass(ctx, object.StorageClass)
 		} else {
 			content.StorageClass = globalMinioDefaultStorageClass
 		}
@@ -543,12 +684,16 @@ func generateListObjectsV1Response(bucket, prefix, marker, delimiter, encodingTy
 }
 
 // generates an ListObjectsV2 response for the said bucket with other enumerated options.
-func generateListObjectsV2Response(bucket, prefix, token, nextToken, startAfter, delimiter, encodingType string, fetchOwner, isTruncated bool, maxKeys int, objects []ObjectInfo, prefixes []string, metadata bool) ListObjectsV2Response {
+func generateListObjectsV2Response(ctx context.Context, bucket, prefix, token, nextToken, startAfter, delimiter, encodingType string, fetchOwner, isTruncated bool, maxKeys int, objects []ObjectInfo, prefixes []string, metadata metaCheckFn) ListObjectsV2Response {
 	contents := make([]Object, 0, len(objects))
-	owner := Owner{
-		ID:          globalMinioDefaultOwnerID,
-		DisplayName: "minio",
+	var owner *Owner
+	if fetchOwner {
+		owner = &Owner{
+			ID:          globalMinioDefaultOwnerID,
+			DisplayName: "minio",
+		}
 	}
+
 	data := ListObjectsV2Response{}
 
 	for _, object := range objects {
@@ -557,38 +702,38 @@ func generateListObjectsV2Response(bucket, prefix, token, nextToken, startAfter,
 			continue
 		}
 		content.Key = s3EncodeName(object.Name, encodingType)
-		content.LastModified = object.ModTime.UTC().Format(iso8601TimeFormat)
+		content.LastModified = amztime.ISO8601Format(object.ModTime.UTC())
 		if object.ETag != "" {
 			content.ETag = "\"" + object.ETag + "\""
 		}
 		content.Size = object.Size
 		if object.StorageClass != "" {
-			content.StorageClass = object.StorageClass
+			content.StorageClass = filterStorageClass(ctx, object.StorageClass)
 		} else {
 			content.StorageClass = globalMinioDefaultStorageClass
 		}
 		content.Owner = owner
-		if metadata {
-			content.UserMetadata = make(StringMap)
-			switch kind, _ := crypto.IsEncrypted(object.UserDefined); kind {
-			case crypto.S3:
-				content.UserMetadata[xhttp.AmzServerSideEncryption] = xhttp.AmzEncryptionAES
-			case crypto.S3KMS:
-				content.UserMetadata[xhttp.AmzServerSideEncryption] = xhttp.AmzEncryptionKMS
-			case crypto.SSEC:
-				content.UserMetadata[xhttp.AmzServerSideEncryptionCustomerAlgorithm] = xhttp.AmzEncryptionAES
+		if metadata != nil {
+			if metadata(object.Name, policy.GetObjectTaggingAction) == ErrNone {
+				content.UserTags = object.UserTags
 			}
-			for k, v := range CleanMinioInternalMetadataKeys(object.UserDefined) {
-				if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
-					// Do not need to send any internal metadata
-					// values to client.
-					continue
+			if metadata(object.Name, policy.GetObjectAction) == ErrNone {
+				content.UserMetadata = &Metadata{}
+				switch kind, _ := crypto.IsEncrypted(object.UserDefined); kind {
+				case crypto.S3:
+					content.UserMetadata.Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionAES)
+				case crypto.S3KMS:
+					content.UserMetadata.Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionKMS)
+				case crypto.SSEC:
+					content.UserMetadata.Set(xhttp.AmzServerSideEncryptionCustomerAlgorithm, xhttp.AmzEncryptionAES)
 				}
-				// https://github.com/google/security-research/security/advisories/GHSA-76wf-9vgp-pj7w
-				if equals(k, xhttp.AmzMetaUnencryptedContentLength, xhttp.AmzMetaUnencryptedContentMD5) {
-					continue
+				for k, v := range cleanReservedKeys(object.UserDefined) {
+					content.UserMetadata.Set(k, v)
 				}
-				content.UserMetadata[k] = v
+				content.Internal = &ObjectInternalInfo{
+					K: object.DataBlocks,
+					M: object.ParityBlocks,
+				}
 			}
 		}
 		contents = append(contents, content)
@@ -616,11 +761,13 @@ func generateListObjectsV2Response(bucket, prefix, token, nextToken, startAfter,
 	return data
 }
 
+type metaCheckFn = func(name string, action policy.Action) (s3Err APIErrorCode)
+
 // generates CopyObjectResponse from etag and lastModified time.
 func generateCopyObjectResponse(etag string, lastModified time.Time) CopyObjectResponse {
 	return CopyObjectResponse{
 		ETag:         "\"" + etag + "\"",
-		LastModified: lastModified.UTC().Format(iso8601TimeFormat),
+		LastModified: amztime.ISO8601Format(lastModified.UTC()),
 	}
 }
 
@@ -628,7 +775,7 @@ func generateCopyObjectResponse(etag string, lastModified time.Time) CopyObjectR
 func generateCopyObjectPartResponse(etag string, lastModified time.Time) CopyObjectPartResponse {
 	return CopyObjectPartResponse{
 		ETag:         "\"" + etag + "\"",
-		LastModified: lastModified.UTC().Format(iso8601TimeFormat),
+		LastModified: amztime.ISO8601Format(lastModified.UTC()),
 	}
 }
 
@@ -642,14 +789,21 @@ func generateInitiateMultipartUploadResponse(bucket, key, uploadID string) Initi
 }
 
 // generates CompleteMultipartUploadResponse for given bucket, key, location and ETag.
-func generateCompleteMultpartUploadResponse(bucket, key, location, etag string) CompleteMultipartUploadResponse {
-	return CompleteMultipartUploadResponse{
+func generateCompleteMultipartUploadResponse(bucket, key, location string, oi ObjectInfo, h http.Header) CompleteMultipartUploadResponse {
+	cs, _ := oi.decryptChecksums(0, h)
+	c := CompleteMultipartUploadResponse{
 		Location: location,
 		Bucket:   bucket,
 		Key:      key,
 		// AWS S3 quotes the ETag in XML, make sure we are compatible here.
-		ETag: "\"" + etag + "\"",
+		ETag:              "\"" + oi.ETag + "\"",
+		ChecksumSHA1:      cs[hash.ChecksumSHA1.String()],
+		ChecksumSHA256:    cs[hash.ChecksumSHA256.String()],
+		ChecksumCRC32:     cs[hash.ChecksumCRC32.String()],
+		ChecksumCRC32C:    cs[hash.ChecksumCRC32C.String()],
+		ChecksumCRC64NVME: cs[hash.ChecksumCRC64NVME.String()],
 	}
+	return c
 }
 
 // generates ListPartsResponse from ListPartsInfo.
@@ -674,6 +828,8 @@ func generateListPartsResponse(partsInfo ListPartsInfo, encodingType string) Lis
 	listPartsResponse.PartNumberMarker = partsInfo.PartNumberMarker
 	listPartsResponse.IsTruncated = partsInfo.IsTruncated
 	listPartsResponse.NextPartNumberMarker = partsInfo.NextPartNumberMarker
+	listPartsResponse.ChecksumAlgorithm = partsInfo.ChecksumAlgorithm
+	listPartsResponse.ChecksumType = partsInfo.ChecksumType
 
 	listPartsResponse.Parts = make([]Part, len(partsInfo.Parts))
 	for index, part := range partsInfo.Parts {
@@ -681,7 +837,12 @@ func generateListPartsResponse(partsInfo ListPartsInfo, encodingType string) Lis
 		newPart.PartNumber = part.PartNumber
 		newPart.ETag = "\"" + part.ETag + "\""
 		newPart.Size = part.Size
-		newPart.LastModified = part.LastModified.UTC().Format(iso8601TimeFormat)
+		newPart.LastModified = amztime.ISO8601Format(part.LastModified.UTC())
+		newPart.ChecksumCRC32 = part.ChecksumCRC32
+		newPart.ChecksumCRC32C = part.ChecksumCRC32C
+		newPart.ChecksumSHA1 = part.ChecksumSHA1
+		newPart.ChecksumSHA256 = part.ChecksumSHA256
+		newPart.ChecksumCRC64NVME = part.ChecksumCRC64NVME
 		listPartsResponse.Parts[index] = newPart
 	}
 	return listPartsResponse
@@ -711,7 +872,7 @@ func generateListMultipartUploadsResponse(bucket string, multipartsInfo ListMult
 		newUpload := Upload{}
 		newUpload.UploadID = upload.UploadID
 		newUpload.Key = s3EncodeName(upload.Object, encodingType)
-		newUpload.Initiated = upload.Initiated.UTC().Format(iso8601TimeFormat)
+		newUpload.Initiated = amztime.ISO8601Format(upload.Initiated.UTC())
 		listMultipartUploadsResponse.Uploads[index] = newUpload
 	}
 	return listMultipartUploadsResponse
@@ -728,6 +889,14 @@ func generateMultiDeleteResponse(quiet bool, deletedObjects []DeletedObject, err
 }
 
 func writeResponse(w http.ResponseWriter, statusCode int, response []byte, mType mimeType) {
+	if statusCode == 0 {
+		statusCode = 200
+	}
+	// Similar check to http.checkWriteHeaderCode
+	if statusCode < 100 || statusCode > 999 {
+		bugLogIf(context.Background(), fmt.Errorf("invalid WriteHeader code %v", statusCode))
+		statusCode = http.StatusInternalServerError
+	}
 	setCommonHeaders(w)
 	if mType != mimeNone {
 		w.Header().Set(xhttp.ContentType, string(mType))
@@ -778,27 +947,38 @@ func writeSuccessResponseHeadersOnly(w http.ResponseWriter) {
 	writeResponse(w, http.StatusOK, nil, mimeNone)
 }
 
-// writeErrorRespone writes error headers
+// writeErrorResponse writes error headers
 func writeErrorResponse(ctx context.Context, w http.ResponseWriter, err APIError, reqURL *url.URL) {
-	switch err.Code {
-	case "SlowDown", "XMinioServerNotInitialized", "XMinioReadQuorum", "XMinioWriteQuorum":
-		// Set retry-after header to indicate user-agents to retry request after 120secs.
+	switch err.HTTPStatusCode {
+	case http.StatusServiceUnavailable, http.StatusTooManyRequests:
+		// Set retry-after header to indicate user-agents to retry request after 60 seconds.
 		// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After
-		w.Header().Set(xhttp.RetryAfter, "120")
+		w.Header().Set(xhttp.RetryAfter, "60")
+	}
+
+	switch err.Code {
 	case "InvalidRegion":
-		err.Description = fmt.Sprintf("Region does not match; expecting '%s'.", globalSite.Region)
+		err.Description = fmt.Sprintf("Region does not match; expecting '%s'.", globalSite.Region())
 	case "AuthorizationHeaderMalformed":
-		err.Description = fmt.Sprintf("The authorization header is malformed; the region is wrong; expecting '%s'.", globalSite.Region)
+		err.Description = fmt.Sprintf("The authorization header is malformed; the region is wrong; expecting '%s'.", globalSite.Region())
+	}
+
+	// Similar check to http.checkWriteHeaderCode
+	if err.HTTPStatusCode < 100 || err.HTTPStatusCode > 999 {
+		bugLogIf(ctx, fmt.Errorf("invalid WriteHeader code %v from %v", err.HTTPStatusCode, err.Code))
+		err.HTTPStatusCode = http.StatusInternalServerError
 	}
 
 	// Generate error response.
 	errorResponse := getAPIErrorResponse(ctx, err, reqURL.Path,
-		w.Header().Get(xhttp.AmzRequestID), globalDeploymentID)
+		w.Header().Get(xhttp.AmzRequestID), w.Header().Get(xhttp.AmzRequestHostID))
 	encodedErrorResponse := encodeResponse(errorResponse)
 	writeResponse(w, err.HTTPStatusCode, encodedErrorResponse, mimeXML)
 }
 
 func writeErrorResponseHeadersOnly(w http.ResponseWriter, err APIError) {
+	w.Header().Set(xMinIOErrCodeHeader, err.Code)
+	w.Header().Set(xMinIOErrDescHeader, "\""+err.Description+"\"")
 	writeResponse(w, err.HTTPStatusCode, nil, mimeNone)
 }
 
@@ -811,7 +991,7 @@ func writeErrorResponseString(ctx context.Context, w http.ResponseWriter, err AP
 // useful for admin APIs.
 func writeErrorResponseJSON(ctx context.Context, w http.ResponseWriter, err APIError, reqURL *url.URL) {
 	// Generate error response.
-	errorResponse := getAPIErrorResponse(ctx, err, reqURL.Path, w.Header().Get(xhttp.AmzRequestID), globalDeploymentID)
+	errorResponse := getAPIErrorResponse(ctx, err, reqURL.Path, w.Header().Get(xhttp.AmzRequestID), w.Header().Get(xhttp.AmzRequestHostID))
 	encodedErrorResponse := encodeResponseJSON(errorResponse)
 	writeResponse(w, err.HTTPStatusCode, encodedErrorResponse, mimeJSON)
 }
@@ -830,7 +1010,7 @@ func writeCustomErrorResponseJSON(ctx context.Context, w http.ResponseWriter, er
 		BucketName: reqInfo.BucketName,
 		Key:        reqInfo.ObjectName,
 		RequestID:  w.Header().Get(xhttp.AmzRequestID),
-		HostID:     globalDeploymentID,
+		HostID:     globalDeploymentID(),
 	}
 	encodedErrorResponse := encodeResponseJSON(errorResponse)
 	writeResponse(w, err.HTTPStatusCode, encodedErrorResponse, mimeJSON)

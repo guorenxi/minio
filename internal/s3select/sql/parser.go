@@ -128,7 +128,7 @@ type JSONPath struct {
 // AliasedExpression is an expression that can be optionally named
 type AliasedExpression struct {
 	Expression *Expression `parser:"@@"`
-	As         string      `parser:"[ \"AS\" @Ident ]"`
+	As         string      `parser:"[ \"AS\" @Ident | \"AS\" @LitString ]"`
 }
 
 // Grammar for Expression
@@ -166,8 +166,7 @@ type Condition struct {
 	Not     *Condition        `parser:"| \"NOT\" @@"`
 }
 
-// ConditionOperand is a operand followed by an an optional operation
-// expression
+// ConditionOperand is a operand followed by an optional operation expression.
 type ConditionOperand struct {
 	Operand      *Operand      `parser:"@@"`
 	ConditionRHS *ConditionRHS `parser:"@@?"`
@@ -202,9 +201,13 @@ type Between struct {
 	End   *Operand `parser:" \"AND\" @@ "`
 }
 
-// In represents the RHS of an IN expression
+// In represents the RHS of an IN expression. The RHS can be a list-literal
+// (i.e. enclosed in parentheses like `IN (1,2,4)`) or it could be a JSON path
+// expression (as in `8.5 IN s.nested[*][*]`). Specifically, it cannot be an
+// `Expression` as an expression can never evaluate to a list.
 type In struct {
-	ListExpression *Expression `parser:"@@ "`
+	JPathExpr *JSONPath `parser:"@@"`
+	ListExpr  *ListExpr `parser:"| @@"`
 }
 
 // Grammar for Operand:
@@ -340,7 +343,8 @@ type LitValue struct {
 	Int     *float64       `parser:" | @Int"` // To avoid value out of range, use float64 instead
 	String  *LiteralString `parser:" | @LitString"`
 	Boolean *Boolean       `parser:" | @(\"TRUE\" | \"FALSE\")"`
-	Null    bool           `parser:" | @\"NULL\")"`
+	Null    bool           `parser:" | @\"NULL\""`
+	Missing bool           `parser:" | @\"MISSING\")"`
 }
 
 // Identifier represents a parsed identifier
@@ -352,7 +356,7 @@ type Identifier struct {
 var (
 	sqlLexer = lexer.Must(lexer.Regexp(`(\s+)` +
 		`|(?P<Timeword>(?i)\b(?:YEAR|MONTH|DAY|HOUR|MINUTE|SECOND|TIMEZONE_HOUR|TIMEZONE_MINUTE)\b)` +
-		`|(?P<Keyword>(?i)\b(?:SELECT|FROM|TOP|DISTINCT|ALL|WHERE|GROUP|BY|HAVING|UNION|MINUS|EXCEPT|INTERSECT|ORDER|LIMIT|OFFSET|TRUE|FALSE|NULL|IS|NOT|ANY|SOME|BETWEEN|AND|OR|LIKE|ESCAPE|AS|IN|BOOL|INT|INTEGER|STRING|FLOAT|DECIMAL|NUMERIC|TIMESTAMP|AVG|COUNT|MAX|MIN|SUM|COALESCE|NULLIF|CAST|DATE_ADD|DATE_DIFF|EXTRACT|TO_STRING|TO_TIMESTAMP|UTCNOW|CHAR_LENGTH|CHARACTER_LENGTH|LOWER|SUBSTRING|TRIM|UPPER|LEADING|TRAILING|BOTH|FOR)\b)` +
+		`|(?P<Keyword>(?i)\b(?:SELECT|FROM|TOP|DISTINCT|ALL|WHERE|GROUP|BY|HAVING|UNION|MINUS|EXCEPT|INTERSECT|ORDER|LIMIT|OFFSET|TRUE|FALSE|NULL|IS|NOT|ANY|SOME|BETWEEN|AND|OR|LIKE|ESCAPE|AS|IN|BOOL|INT|INTEGER|STRING|FLOAT|DECIMAL|NUMERIC|TIMESTAMP|AVG|COUNT|MAX|MIN|SUM|COALESCE|NULLIF|CAST|DATE_ADD|DATE_DIFF|EXTRACT|TO_STRING|TO_TIMESTAMP|UTCNOW|CHAR_LENGTH|CHARACTER_LENGTH|LOWER|SUBSTRING|TRIM|UPPER|LEADING|TRAILING|BOTH|FOR|MISSING)\b)` +
 		`|(?P<Ident>[a-zA-Z_][a-zA-Z0-9_]*)` +
 		`|(?P<QuotIdent>"([^"]*("")?)*")` +
 		`|(?P<Float>\d*\.\d+([eE][-+]?\d+)?)` +

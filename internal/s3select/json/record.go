@@ -26,8 +26,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bcicen/jstream"
 	csv "github.com/minio/csvparser"
+	"github.com/minio/minio/internal/s3select/jstream"
 	"github.com/minio/minio/internal/s3select/sql"
 )
 
@@ -89,6 +89,8 @@ func (r *Record) Set(name string, value *sql.Value) (sql.Record, error) {
 		v = s
 	} else if value.IsNull() {
 		v = nil
+	} else if value.IsMissing() {
+		return r, nil
 	} else if b, ok := value.ToBytes(); ok {
 		// This can either be raw json or a CSV value.
 		// Only treat objects and arrays as JSON.

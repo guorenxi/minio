@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/tinylib/msgp/msgp"
 )
@@ -28,6 +29,9 @@ func (x *xlMetaV2VersionHeader) unmarshalV(v uint8, bts []byte) (o []byte, err e
 	switch v {
 	case 1:
 		return x.unmarshalV1(bts)
+	case 2:
+		x2 := xlMetaV2VersionHeaderV2{xlMetaV2VersionHeader: x}
+		return x2.UnmarshalMsg(bts)
 	case xlHeaderVersion:
 		return x.UnmarshalMsg(bts)
 	}
@@ -80,25 +84,149 @@ func (x *xlMetaV2VersionHeader) unmarshalV1(bts []byte) (o []byte, err error) {
 
 // unmarshalV unmarshals with a specific metadata version.
 func (j *xlMetaV2Version) unmarshalV(v uint8, bts []byte) (o []byte, err error) {
-	switch v {
-	// We accept un-set as latest version.
-	case 0, xlMetaVersion:
-		o, err = j.UnmarshalMsg(bts)
+	if v > xlMetaVersion {
+		return bts, fmt.Errorf("unknown xlMetaVersion: %d", v)
+	}
 
-		// Clean up PartEtags on v1
-		if j.ObjectV2 != nil {
-			allEmpty := true
-			for _, tag := range j.ObjectV2.PartETags {
-				if len(tag) != 0 {
-					allEmpty = false
-					break
-				}
-			}
-			if allEmpty {
-				j.ObjectV2.PartETags = nil
+	// Clear omitempty fields:
+	if j.ObjectV2 != nil && len(j.ObjectV2.PartIndices) > 0 {
+		j.ObjectV2.PartIndices = j.ObjectV2.PartIndices[:0]
+	}
+	o, err = j.UnmarshalMsg(bts)
+
+	// Fix inconsistent x-minio-internal-replication-timestamp by converting to UTC.
+	// Fixed in version 2 or later
+	if err == nil && j.Type == DeleteType && v < 2 {
+		if val, ok := j.DeleteMarker.MetaSys[ReservedMetadataPrefixLower+ReplicationTimestamp]; ok {
+			tm, err := time.Parse(time.RFC3339Nano, string(val))
+			if err == nil {
+				j.DeleteMarker.MetaSys[ReservedMetadataPrefixLower+ReplicationTimestamp] = []byte(tm.UTC().Format(time.RFC3339Nano))
 			}
 		}
-		return o, err
+		if val, ok := j.DeleteMarker.MetaSys[ReservedMetadataPrefixLower+ReplicaTimestamp]; ok {
+			tm, err := time.Parse(time.RFC3339Nano, string(val))
+			if err == nil {
+				j.DeleteMarker.MetaSys[ReservedMetadataPrefixLower+ReplicaTimestamp] = []byte(tm.UTC().Format(time.RFC3339Nano))
+			}
+		}
 	}
-	return bts, fmt.Errorf("unknown xlMetaVersion: %d", v)
+
+	// Clean up PartEtags on v1
+	if j.ObjectV2 != nil {
+		allEmpty := true
+		for _, tag := range j.ObjectV2.PartETags {
+			if len(tag) != 0 {
+				allEmpty = false
+				break
+			}
+		}
+		if allEmpty {
+			j.ObjectV2.PartETags = nil
+		}
+	}
+	return o, err
+}
+
+// xlMetaV2VersionHeaderV2 is a version 2 of xlMetaV2VersionHeader before EcN and EcM were added.
+type xlMetaV2VersionHeaderV2 struct {
+	*xlMetaV2VersionHeader
+}
+
+// UnmarshalMsg implements msgp.Unmarshaler
+func (z *xlMetaV2VersionHeaderV2) UnmarshalMsg(bts []byte) (o []byte, err error) {
+	z.EcN, z.EcN = 0, 0
+	var zb0001 uint32
+	zb0001, bts, err = msgp.ReadArrayHeaderBytes(bts)
+	if err != nil {
+		err = msgp.WrapError(err)
+		return
+	}
+	if zb0001 != 5 {
+		err = msgp.ArrayError{Wanted: 5, Got: zb0001}
+		return
+	}
+	bts, err = msgp.ReadExactBytes(bts, (z.VersionID)[:])
+	if err != nil {
+		err = msgp.WrapError(err, "VersionID")
+		return
+	}
+	z.ModTime, bts, err = msgp.ReadInt64Bytes(bts)
+	if err != nil {
+		err = msgp.WrapError(err, "ModTime")
+		return
+	}
+	bts, err = msgp.ReadExactBytes(bts, (z.Signature)[:])
+	if err != nil {
+		err = msgp.WrapError(err, "Signature")
+		return
+	}
+	{
+		var zb0002 uint8
+		zb0002, bts, err = msgp.ReadUint8Bytes(bts)
+		if err != nil {
+			err = msgp.WrapError(err, "Type")
+			return
+		}
+		z.Type = VersionType(zb0002)
+	}
+	{
+		var zb0003 uint8
+		zb0003, bts, err = msgp.ReadUint8Bytes(bts)
+		if err != nil {
+			err = msgp.WrapError(err, "Flags")
+			return
+		}
+		z.Flags = xlFlags(zb0003)
+	}
+	o = bts
+	return
+}
+
+// DecodeMsg implements msgp.Decodable
+func (z *xlMetaV2VersionHeaderV2) DecodeMsg(dc *msgp.Reader) (err error) {
+	z.EcN, z.EcN = 0, 0
+	var zb0001 uint32
+	zb0001, err = dc.ReadArrayHeader()
+	if err != nil {
+		err = msgp.WrapError(err)
+		return
+	}
+	if zb0001 != 5 {
+		err = msgp.ArrayError{Wanted: 5, Got: zb0001}
+		return
+	}
+	err = dc.ReadExactBytes((z.VersionID)[:])
+	if err != nil {
+		err = msgp.WrapError(err, "VersionID")
+		return
+	}
+	z.ModTime, err = dc.ReadInt64()
+	if err != nil {
+		err = msgp.WrapError(err, "ModTime")
+		return
+	}
+	err = dc.ReadExactBytes((z.Signature)[:])
+	if err != nil {
+		err = msgp.WrapError(err, "Signature")
+		return
+	}
+	{
+		var zb0002 uint8
+		zb0002, err = dc.ReadUint8()
+		if err != nil {
+			err = msgp.WrapError(err, "Type")
+			return
+		}
+		z.Type = VersionType(zb0002)
+	}
+	{
+		var zb0003 uint8
+		zb0003, err = dc.ReadUint8()
+		if err != nil {
+			err = msgp.WrapError(err, "Flags")
+			return
+		}
+		z.Flags = xlFlags(zb0003)
+	}
+	return
 }

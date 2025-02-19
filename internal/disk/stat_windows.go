@@ -21,6 +21,7 @@
 package disk
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"syscall"
@@ -47,7 +48,7 @@ var (
 // It returns free space available to the user (including quota limitations)
 //
 // https://msdn.microsoft.com/en-us/library/windows/desktop/aa364937(v=vs.85).aspx
-func GetInfo(path string) (info Info, err error) {
+func GetInfo(path string, _ bool) (info Info, err error) {
 	// Stat to know if the path exists.
 	if _, err = os.Stat(path); err != nil {
 		return Info{}, err
@@ -70,7 +71,7 @@ func GetInfo(path string) (info Info, err error) {
 		uintptr(unsafe.Pointer(&lpTotalNumberOfFreeBytes)))
 
 	if uint64(lpTotalNumberOfFreeBytes) > uint64(lpTotalNumberOfBytes) {
-		return info, fmt.Errorf("detected free space (%d) > total disk space (%d), fs corruption at (%s). please run 'fsck'",
+		return info, fmt.Errorf("detected free space (%d) > total drive space (%d), fs corruption at (%s). please run 'fsck'",
 			uint64(lpTotalNumberOfFreeBytes), uint64(lpTotalNumberOfBytes), path)
 	}
 
@@ -105,4 +106,9 @@ func GetInfo(path string) (info Info, err error) {
 	info.Ffree = uint64(lpNumberOfFreeClusters)
 
 	return info, nil
+}
+
+// GetDriveStats returns IO stats of the drive by its major:minor
+func GetDriveStats(major, minor uint32) (iostats IOStats, err error) {
+	return IOStats{}, errors.New("operation unsupported")
 }

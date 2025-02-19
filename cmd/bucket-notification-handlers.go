@@ -23,10 +23,10 @@ import (
 	"net/http"
 	"reflect"
 
-	"github.com/gorilla/mux"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/bucket/policy"
+	"github.com/minio/mux"
+	"github.com/minio/pkg/v3/policy"
 )
 
 const (
@@ -50,17 +50,12 @@ func (api objectAPIHandlers) GetBucketNotificationHandler(w http.ResponseWriter,
 		return
 	}
 
-	if !objAPI.IsNotificationSupported() {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
-		return
-	}
-
 	if s3Error := checkRequestAuthType(ctx, r, policy.GetBucketNotificationAction, bucketName, ""); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
 
-	_, err := objAPI.GetBucketInfo(ctx, bucketName)
+	_, err := objAPI.GetBucketInfo(ctx, bucketName, BucketOptions{})
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
@@ -71,8 +66,9 @@ func (api objectAPIHandlers) GetBucketNotificationHandler(w http.ResponseWriter,
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
-	config.SetRegion(globalSite.Region)
-	if err = config.Validate(globalSite.Region, globalNotificationSys.targetList); err != nil {
+	region := globalSite.Region()
+	config.SetRegion(region)
+	if err = config.Validate(region, globalEventNotifier.targetList); err != nil {
 		arnErr, ok := err.(*event.ErrARNNotFound)
 		if ok {
 			for i, queue := range config.QueueList {
@@ -119,11 +115,6 @@ func (api objectAPIHandlers) PutBucketNotificationHandler(w http.ResponseWriter,
 		return
 	}
 
-	if !objectAPI.IsNotificationSupported() {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
-		return
-	}
-
 	vars := mux.Vars(r)
 	bucketName := vars["bucket"]
 
@@ -132,7 +123,7 @@ func (api objectAPIHandlers) PutBucketNotificationHandler(w http.ResponseWriter,
 		return
 	}
 
-	_, err := objectAPI.GetBucketInfo(ctx, bucketName)
+	_, err := objectAPI.GetBucketInfo(ctx, bucketName, BucketOptions{})
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
@@ -144,7 +135,7 @@ func (api objectAPIHandlers) PutBucketNotificationHandler(w http.ResponseWriter,
 		return
 	}
 
-	config, err := event.ParseConfig(io.LimitReader(r.Body, r.ContentLength), globalSite.Region, globalNotificationSys.targetList)
+	config, err := event.ParseConfig(io.LimitReader(r.Body, r.ContentLength), globalSite.Region(), globalEventNotifier.targetList)
 	if err != nil {
 		apiErr := errorCodes.ToAPIErr(ErrMalformedXML)
 		if event.IsEventError(err) {
@@ -160,13 +151,13 @@ func (api objectAPIHandlers) PutBucketNotificationHandler(w http.ResponseWriter,
 		return
 	}
 
-	if err = globalBucketMetadataSys.Update(ctx, bucketName, bucketNotificationConfig, configData); err != nil {
+	if _, err = globalBucketMetadataSys.Update(ctx, bucketName, bucketNotificationConfig, configData); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
 
 	rulesMap := config.ToRulesMap()
-	globalNotificationSys.AddRulesMap(bucketName, rulesMap)
+	globalEventNotifier.AddRulesMap(bucketName, rulesMap)
 
 	writeSuccessResponseHeadersOnly(w)
 }

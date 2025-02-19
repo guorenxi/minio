@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -23,8 +23,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
@@ -36,7 +34,11 @@ import (
 	elasticsearch7 "github.com/elastic/go-elasticsearch/v7"
 	"github.com/minio/highwayhash"
 	"github.com/minio/minio/internal/event"
-	xnet "github.com/minio/pkg/net"
+	xhttp "github.com/minio/minio/internal/http"
+	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/once"
+	"github.com/minio/minio/internal/store"
+	xnet "github.com/minio/pkg/v3/net"
 	"github.com/pkg/errors"
 )
 
@@ -69,7 +71,7 @@ const (
 	ESSUnknown ESSupportStatus = "ESSUnknown"
 	// ESSDeprecated -> support will be removed in future
 	ESSDeprecated ESSupportStatus = "ESSDeprecated"
-	// ESSUnsupported -> we wont work with this ES server
+	// ESSUnsupported -> we won't work with this ES server
 	ESSUnsupported ESSupportStatus = "ESSUnsupported"
 	// ESSSupported -> all good!
 	ESSSupported ESSupportStatus = "ESSSupported"
@@ -152,11 +154,14 @@ func (a ElasticsearchArgs) Validate() error {
 
 // ElasticsearchTarget - Elasticsearch target.
 type ElasticsearchTarget struct {
+	initOnce once.Init
+
 	id         event.TargetID
 	args       ElasticsearchArgs
 	client     esClient
-	store      Store
-	loggerOnce func(ctx context.Context, err error, id interface{}, errKind ...interface{})
+	store      store.Store[event.Event]
+	loggerOnce logger.LogOnce
+	quitCh     chan struct{}
 }
 
 // ID - returns target ID.
@@ -164,13 +169,25 @@ func (target *ElasticsearchTarget) ID() event.TargetID {
 	return target.id
 }
 
-// HasQueueStore - Checks if the queueStore has been configured for the target
-func (target *ElasticsearchTarget) HasQueueStore() bool {
-	return target.store != nil
+// Name - returns the Name of the target.
+func (target *ElasticsearchTarget) Name() string {
+	return target.ID().String()
+}
+
+// Store returns any underlying store if set.
+func (target *ElasticsearchTarget) Store() event.TargetStore {
+	return target.store
 }
 
 // IsActive - Return true if target is up and active
 func (target *ElasticsearchTarget) IsActive() (bool, error) {
+	if err := target.init(); err != nil {
+		return false, err
+	}
+	return target.isActive()
+}
+
+func (target *ElasticsearchTarget) isActive() (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -185,7 +202,11 @@ func (target *ElasticsearchTarget) IsActive() (bool, error) {
 // Save - saves the events to the store if queuestore is configured, which will be replayed when the elasticsearch connection is active.
 func (target *ElasticsearchTarget) Save(eventData event.Event) error {
 	if target.store != nil {
-		return target.store.Put(eventData)
+		_, err := target.store.Put(eventData)
+		return err
+	}
+	if err := target.init(); err != nil {
+		return err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -198,7 +219,7 @@ func (target *ElasticsearchTarget) Save(eventData event.Event) error {
 
 	err = target.send(eventData)
 	if xnet.IsNetworkOrHostDown(err, false) {
-		return errNotConnected
+		return store.ErrNotConnected
 	}
 	return err
 }
@@ -244,8 +265,12 @@ func (target *ElasticsearchTarget) send(eventData event.Event) error {
 	return nil
 }
 
-// Send - reads an event from store and sends it to Elasticsearch.
-func (target *ElasticsearchTarget) Send(eventKey string) error {
+// SendFromStore - reads an event from store and sends it to Elasticsearch.
+func (target *ElasticsearchTarget) SendFromStore(key store.Key) error {
+	if err := target.init(); err != nil {
+		return err
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -254,7 +279,7 @@ func (target *ElasticsearchTarget) Send(eventKey string) error {
 		return err
 	}
 
-	eventData, eErr := target.store.Get(eventKey)
+	eventData, eErr := target.store.Get(key)
 	if eErr != nil {
 		// The last event key in a successful batch will be sent in the channel atmost once by the replayEvents()
 		// Such events will not exist and wouldve been already been sent successfully.
@@ -266,17 +291,18 @@ func (target *ElasticsearchTarget) Send(eventKey string) error {
 
 	if err := target.send(eventData); err != nil {
 		if xnet.IsNetworkOrHostDown(err, false) {
-			return errNotConnected
+			return store.ErrNotConnected
 		}
 		return err
 	}
 
 	// Delete the event from store.
-	return target.store.Del(eventKey)
+	return target.store.Del(key)
 }
 
 // Close - does nothing and available for interface compatibility.
 func (target *ElasticsearchTarget) Close() error {
+	close(target.quitCh)
 	if target.client != nil {
 		// Stops the background processes that the client is running.
 		target.client.stop()
@@ -319,39 +345,46 @@ func (target *ElasticsearchTarget) checkAndInitClient(ctx context.Context) error
 	return nil
 }
 
-// NewElasticsearchTarget - creates new Elasticsearch target.
-func NewElasticsearchTarget(id string, args ElasticsearchArgs, doneCh <-chan struct{}, loggerOnce func(ctx context.Context, err error, id interface{}, kind ...interface{}), test bool) (*ElasticsearchTarget, error) {
-	target := &ElasticsearchTarget{
-		id:         event.TargetID{ID: id, Name: "elasticsearch"},
-		args:       args,
-		loggerOnce: loggerOnce,
-	}
+func (target *ElasticsearchTarget) init() error {
+	return target.initOnce.Do(target.initElasticsearch)
+}
 
-	if args.QueueDir != "" {
-		queueDir := filepath.Join(args.QueueDir, storePrefix+"-elasticsearch-"+id)
-		target.store = NewQueueStore(queueDir, args.QueueLimit)
-		if err := target.store.Open(); err != nil {
-			target.loggerOnce(context.Background(), err, target.ID())
-			return target, err
-		}
-	}
-
+func (target *ElasticsearchTarget) initElasticsearch() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	err := target.checkAndInitClient(ctx)
 	if err != nil {
-		if target.store == nil || err != errNotConnected {
-			target.loggerOnce(context.Background(), err, target.ID())
-			return target, err
+		if err != store.ErrNotConnected {
+			target.loggerOnce(context.Background(), err, target.ID().String())
+		}
+		return err
+	}
+
+	return nil
+}
+
+// NewElasticsearchTarget - creates new Elasticsearch target.
+func NewElasticsearchTarget(id string, args ElasticsearchArgs, loggerOnce logger.LogOnce) (*ElasticsearchTarget, error) {
+	var queueStore store.Store[event.Event]
+	if args.QueueDir != "" {
+		queueDir := filepath.Join(args.QueueDir, storePrefix+"-elasticsearch-"+id)
+		queueStore = store.NewQueueStore[event.Event](queueDir, args.QueueLimit, event.StoreExtension)
+		if err := queueStore.Open(); err != nil {
+			return nil, fmt.Errorf("unable to initialize the queue store of Elasticsearch `%s`: %w", id, err)
 		}
 	}
 
-	if target.store != nil && !test {
-		// Replays the events from the store.
-		eventKeyCh := replayEvents(target.store, doneCh, target.loggerOnce, target.ID())
-		// Start replaying events from the store.
-		go sendEvents(target, eventKeyCh, doneCh, target.loggerOnce)
+	target := &ElasticsearchTarget{
+		id:         event.TargetID{ID: id, Name: "elasticsearch"},
+		args:       args,
+		store:      queueStore,
+		loggerOnce: loggerOnce,
+		quitCh:     make(chan struct{}),
+	}
+
+	if target.store != nil {
+		store.StreamItems(target.store, target, target.quitCh, target.loggerOnce)
 	}
 
 	return target, nil
@@ -389,7 +422,7 @@ func (c *esClientV7) getServerSupportStatus(ctx context.Context) (ESSupportStatu
 		c.Info.WithContext(ctx),
 	)
 	if err != nil {
-		return ESSUnknown, "", errNotConnected
+		return ESSUnknown, "", store.ErrNotConnected
 	}
 
 	defer resp.Body.Close()
@@ -430,8 +463,7 @@ func (c *esClientV7) createIndex(args ElasticsearchArgs) error {
 	indices, ok := v["indices"].([]interface{})
 	if ok {
 		for _, index := range indices {
-			name := index.(map[string]interface{})["name"]
-			if name == args.Index {
+			if name, ok := index.(map[string]interface{}); ok && name["name"] == args.Index {
 				found = true
 				break
 			}
@@ -443,12 +475,10 @@ func (c *esClientV7) createIndex(args ElasticsearchArgs) error {
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer xhttp.DrainBody(resp.Body)
 		if resp.IsError() {
-			err := fmt.Errorf("Create index err: %s", res.String())
-			return err
+			return fmt.Errorf("Create index err: %v", res)
 		}
-		io.Copy(ioutil.Discard, resp.Body)
 		return nil
 	}
 	return nil
@@ -459,10 +489,9 @@ func (c *esClientV7) ping(ctx context.Context, _ ElasticsearchArgs) (bool, error
 		c.Ping.WithContext(ctx),
 	)
 	if err != nil {
-		return false, errNotConnected
+		return false, store.ErrNotConnected
 	}
-	io.Copy(ioutil.Discard, resp.Body)
-	resp.Body.Close()
+	xhttp.DrainBody(resp.Body)
 	return !resp.IsError(), nil
 }
 
@@ -475,8 +504,7 @@ func (c *esClientV7) entryExists(ctx context.Context, index string, key string) 
 	if err != nil {
 		return false, err
 	}
-	io.Copy(ioutil.Discard, res.Body)
-	res.Body.Close()
+	xhttp.DrainBody(res.Body)
 	return !res.IsError(), nil
 }
 
@@ -491,12 +519,10 @@ func (c *esClientV7) removeEntry(ctx context.Context, index string, key string) 
 		if err != nil {
 			return err
 		}
-		defer res.Body.Close()
+		defer xhttp.DrainBody(res.Body)
 		if res.IsError() {
-			err := fmt.Errorf("Delete err: %s", res.String())
-			return err
+			return fmt.Errorf("Delete err: %s", res.String())
 		}
-		io.Copy(ioutil.Discard, res.Body)
 		return nil
 	}
 	return err
@@ -521,12 +547,11 @@ func (c *esClientV7) updateEntry(ctx context.Context, index string, key string, 
 	if err != nil {
 		return err
 	}
-	defer res.Body.Close()
+	defer xhttp.DrainBody(res.Body)
 	if res.IsError() {
-		err := fmt.Errorf("Update err: %s", res.String())
-		return err
+		return fmt.Errorf("Update err: %s", res.String())
 	}
-	io.Copy(ioutil.Discard, res.Body)
+
 	return nil
 }
 
@@ -548,12 +573,10 @@ func (c *esClientV7) addEntry(ctx context.Context, index string, eventData event
 	if err != nil {
 		return err
 	}
-	defer res.Body.Close()
+	defer xhttp.DrainBody(res.Body)
 	if res.IsError() {
-		err := fmt.Errorf("Add err: %s", res.String())
-		return err
+		return fmt.Errorf("Add err: %s", res.String())
 	}
-	io.Copy(ioutil.Discard, res.Body)
 	return nil
 }
 
