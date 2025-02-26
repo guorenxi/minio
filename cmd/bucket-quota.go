@@ -20,28 +20,22 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio/internal/cachevalue"
+	"github.com/minio/minio/internal/logger"
 )
 
 // BucketQuotaSys - map of bucket and quota configuration.
-type BucketQuotaSys struct {
-	bucketStorageCache timedValue
-}
+type BucketQuotaSys struct{}
 
 // Get - Get quota configuration.
 func (sys *BucketQuotaSys) Get(ctx context.Context, bucketName string) (*madmin.BucketQuota, error) {
-	if globalIsGateway {
-		objAPI := newObjectLayerFn()
-		if objAPI == nil {
-			return nil, errServerNotInitialized
-		}
-		return &madmin.BucketQuota{}, nil
-	}
-
-	return globalBucketMetadataSys.GetQuotaConfig(ctx, bucketName)
+	cfg, _, err := globalBucketMetadataSys.GetQuotaConfig(ctx, bucketName)
+	return cfg, err
 }
 
 // NewBucketQuotaSys returns initialized BucketQuotaSys
@@ -49,33 +43,45 @@ func NewBucketQuotaSys() *BucketQuotaSys {
 	return &BucketQuotaSys{}
 }
 
+var bucketStorageCache = cachevalue.New[DataUsageInfo]()
+
 // Init initialize bucket quota.
 func (sys *BucketQuotaSys) Init(objAPI ObjectLayer) {
-	sys.bucketStorageCache.Once.Do(func() {
-		sys.bucketStorageCache.TTL = 1 * time.Second
-		sys.bucketStorageCache.Update = func() (interface{}, error) {
-			ctx, done := context.WithTimeout(context.Background(), 5*time.Second)
+	bucketStorageCache.InitOnce(10*time.Second,
+		cachevalue.Opts{ReturnLastGood: true, NoWait: true},
+		func(ctx context.Context) (DataUsageInfo, error) {
+			if objAPI == nil {
+				return DataUsageInfo{}, errServerNotInitialized
+			}
+			ctx, done := context.WithTimeout(ctx, 2*time.Second)
 			defer done()
 
 			return loadDataUsageFromBackend(ctx, objAPI)
-		}
-	})
+		},
+	)
 }
 
 // GetBucketUsageInfo return bucket usage info for a given bucket
-func (sys *BucketQuotaSys) GetBucketUsageInfo(bucket string) (BucketUsageInfo, error) {
-	v, err := sys.bucketStorageCache.Get()
-	if err != nil {
-		return BucketUsageInfo{}, err
+func (sys *BucketQuotaSys) GetBucketUsageInfo(ctx context.Context, bucket string) BucketUsageInfo {
+	sys.Init(newObjectLayerFn())
+
+	dui, err := bucketStorageCache.GetWithCtx(ctx)
+	timedout := OperationTimedOut{}
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.As(err, &timedout) {
+		if len(dui.BucketsUsage) > 0 {
+			internalLogOnceIf(GlobalContext, fmt.Errorf("unable to retrieve usage information for bucket: %s, relying on older value cached in-memory: err(%v)", bucket, err), "bucket-usage-cache-"+bucket)
+		} else {
+			internalLogOnceIf(GlobalContext, errors.New("unable to retrieve usage information for bucket: %s, no reliable usage value available - quota will not be enforced"), "bucket-usage-empty-"+bucket)
+		}
 	}
 
-	dui, ok := v.(DataUsageInfo)
-	if !ok {
-		return BucketUsageInfo{}, fmt.Errorf("internal error: Unexpected DUI data type: %T", v)
+	if len(dui.BucketsUsage) > 0 {
+		bui, ok := dui.BucketsUsage[bucket]
+		if ok {
+			return bui
+		}
 	}
-
-	bui := dui.BucketsUsage[bucket]
-	return bui, nil
+	return BucketUsageInfo{}
 }
 
 // parseBucketQuota parses BucketQuota from json
@@ -85,6 +91,10 @@ func parseBucketQuota(bucket string, data []byte) (quotaCfg *madmin.BucketQuota,
 		return quotaCfg, err
 	}
 	if !quotaCfg.IsValid() {
+		if quotaCfg.Type == "fifo" {
+			internalLogIf(GlobalContext, errors.New("Detected older 'fifo' quota config, 'fifo' feature is removed and not supported anymore. Please clear your quota configs using 'mc admin bucket quota alias/bucket --clear' and use 'mc ilm add' for expiration of objects"), logger.WarningKind)
+			return quotaCfg, fmt.Errorf("invalid quota type 'fifo'")
+		}
 		return quotaCfg, fmt.Errorf("Invalid quota config %#v", quotaCfg)
 	}
 	return
@@ -100,13 +110,21 @@ func (sys *BucketQuotaSys) enforceQuotaHard(ctx context.Context, bucket string, 
 		return err
 	}
 
-	if q != nil && q.Type == madmin.HardQuota && q.Quota > 0 {
-		bui, err := sys.GetBucketUsageInfo(bucket)
-		if err != nil {
-			return err
+	var quotaSize uint64
+	if q != nil && q.Type == madmin.HardQuota {
+		if q.Size > 0 {
+			quotaSize = q.Size
+		} else if q.Quota > 0 {
+			quotaSize = q.Quota
+		}
+	}
+	if quotaSize > 0 {
+		if uint64(size) >= quotaSize { // check if file size already exceeds the quota
+			return BucketQuotaExceeded{Bucket: bucket}
 		}
 
-		if bui.Size > 0 && ((bui.Size + uint64(size)) >= q.Quota) {
+		bui := sys.GetBucketUsageInfo(ctx, bucket)
+		if bui.Size > 0 && ((bui.Size + uint64(size)) >= quotaSize) {
 			return BucketQuotaExceeded{Bucket: bucket}
 		}
 	}

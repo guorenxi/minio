@@ -21,7 +21,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io/ioutil"
+	"io"
 	"net/http"
 
 	"github.com/minio/minio/internal/hash"
@@ -29,10 +29,9 @@ import (
 
 var errConfigNotFound = errors.New("config file not found")
 
-func readConfigWithMetadata(ctx context.Context, store objectIO, configFile string) ([]byte, ObjectInfo, error) {
-	r, err := store.GetObjectNInfo(ctx, minioMetaBucket, configFile, nil, http.Header{}, readLock, ObjectOptions{})
+func readConfigWithMetadata(ctx context.Context, store objectIO, configFile string, opts ObjectOptions) ([]byte, ObjectInfo, error) {
+	r, err := store.GetObjectNInfo(ctx, minioMetaBucket, configFile, nil, http.Header{}, opts)
 	if err != nil {
-		// Treat object not found as config not found.
 		if isErrObjectNotFound(err) {
 			return nil, ObjectInfo{}, errConfigNotFound
 		}
@@ -41,7 +40,7 @@ func readConfigWithMetadata(ctx context.Context, store objectIO, configFile stri
 	}
 	defer r.Close()
 
-	buf, err := ioutil.ReadAll(r)
+	buf, err := io.ReadAll(r)
 	if err != nil {
 		return nil, ObjectInfo{}, err
 	}
@@ -52,7 +51,7 @@ func readConfigWithMetadata(ctx context.Context, store objectIO, configFile stri
 }
 
 func readConfig(ctx context.Context, store objectIO, configFile string) ([]byte, error) {
-	buf, _, err := readConfigWithMetadata(ctx, store, configFile)
+	buf, _, err := readConfigWithMetadata(ctx, store, configFile, ObjectOptions{})
 	return buf, err
 }
 
@@ -62,7 +61,8 @@ type objectDeleter interface {
 
 func deleteConfig(ctx context.Context, objAPI objectDeleter, configFile string) error {
 	_, err := objAPI.DeleteObject(ctx, minioMetaBucket, configFile, ObjectOptions{
-		DeletePrefix: true,
+		DeletePrefix:       true,
+		DeletePrefixObject: true, // use prefix delete on exact object (this is an optimization to avoid fan-out calls)
 	})
 	if err != nil && isErrObjectNotFound(err) {
 		return errConfigNotFound
@@ -70,14 +70,18 @@ func deleteConfig(ctx context.Context, objAPI objectDeleter, configFile string) 
 	return err
 }
 
-func saveConfig(ctx context.Context, store objectIO, configFile string, data []byte) error {
-	hashReader, err := hash.NewReader(bytes.NewReader(data), int64(len(data)), "", getSHA256Hash(data), int64(len(data)))
+func saveConfigWithOpts(ctx context.Context, store objectIO, configFile string, data []byte, opts ObjectOptions) error {
+	hashReader, err := hash.NewReader(ctx, bytes.NewReader(data), int64(len(data)), "", getSHA256Hash(data), int64(len(data)))
 	if err != nil {
 		return err
 	}
 
-	_, err = store.PutObject(ctx, minioMetaBucket, configFile, NewPutObjReader(hashReader), ObjectOptions{MaxParity: true})
+	_, err = store.PutObject(ctx, minioMetaBucket, configFile, NewPutObjReader(hashReader), opts)
 	return err
+}
+
+func saveConfig(ctx context.Context, store objectIO, configFile string, data []byte) error {
+	return saveConfigWithOpts(ctx, store, configFile, data, ObjectOptions{MaxParity: true})
 }
 
 func checkConfig(ctx context.Context, objAPI ObjectLayer, configFile string) error {

@@ -20,18 +20,17 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path"
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/minio/minio-go/v7/pkg/set"
-	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/kms"
-	"github.com/minio/minio/internal/logger"
+	"github.com/puzpuzpuz/xsync/v3"
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	etcd "go.etcd.io/etcd/client/v3"
 )
@@ -49,10 +48,11 @@ func etcdKvsToSet(prefix string, kvs []*mvccpb.KeyValue) set.StringSet {
 
 // Extract path string by stripping off the `prefix` value and the suffix,
 // value, usually in the following form.
-//  s := "config/iam/users/foo/config.json"
-//  prefix := "config/iam/users/"
-//  suffix := "config.json"
-//  result is foo
+//
+//	s := "config/iam/users/foo/config.json"
+//	prefix := "config/iam/users/"
+//	suffix := "config.json"
+//	result is foo
 func extractPathPrefixAndSuffix(s string, prefix string, suffix string) string {
 	return pathClean(strings.TrimSuffix(strings.TrimPrefix(s, prefix), suffix))
 }
@@ -114,26 +114,6 @@ func (ies *IAMEtcdStore) saveIAMConfig(ctx context.Context, item interface{}, it
 	return saveKeyEtcd(ctx, ies.client, itemPath, data, opts...)
 }
 
-func decryptData(data []byte, itemPath string) ([]byte, error) {
-	var err error
-	if !utf8.Valid(data) && GlobalKMS != nil {
-		data, err = config.DecryptBytes(GlobalKMS, data, kms.Context{
-			minioMetaBucket: path.Join(minioMetaBucket, itemPath),
-		})
-		if err != nil {
-			// This fallback is needed because of a bug, in kms.Context{}
-			// construction during migration.
-			data, err = config.DecryptBytes(GlobalKMS, data, kms.Context{
-				minioMetaBucket: itemPath,
-			})
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-	return data, nil
-}
-
 func getIAMConfig(item interface{}, data []byte, itemPath string) error {
 	data, err := decryptData(data, itemPath)
 	if err != nil {
@@ -163,119 +143,8 @@ func (ies *IAMEtcdStore) deleteIAMConfig(ctx context.Context, path string) error
 	return deleteKeyEtcd(ctx, ies.client, path)
 }
 
-func (ies *IAMEtcdStore) migrateUsersConfigToV1(ctx context.Context) error {
-	basePrefix := iamConfigUsersPrefix
-	ctx, cancel := context.WithTimeout(ctx, defaultContextTimeout)
-	defer cancel()
-	r, err := ies.client.Get(ctx, basePrefix, etcd.WithPrefix(), etcd.WithKeysOnly())
-	if err != nil {
-		return err
-	}
-
-	users := etcdKvsToSet(basePrefix, r.Kvs)
-	for _, user := range users.ToSlice() {
-		{
-			// 1. check if there is a policy file in the old loc.
-			oldPolicyPath := pathJoin(basePrefix, user, iamPolicyFile)
-			var policyName string
-			err := ies.loadIAMConfig(ctx, &policyName, oldPolicyPath)
-			if err != nil {
-				switch err {
-				case errConfigNotFound:
-					// No mapped policy or already migrated.
-				default:
-					// corrupt data/read error, etc
-				}
-				goto next
-			}
-
-			// 2. copy policy to new loc.
-			mp := newMappedPolicy(policyName)
-			userType := regUser
-			path := getMappedPolicyPath(user, userType, false)
-			if err := ies.saveIAMConfig(ctx, mp, path); err != nil {
-				return err
-			}
-
-			// 3. delete policy file in old loc.
-			deleteKeyEtcd(ctx, ies.client, oldPolicyPath)
-		}
-
-	next:
-		// 4. check if user identity has old format.
-		identityPath := pathJoin(basePrefix, user, iamIdentityFile)
-		var cred auth.Credentials
-		if err := ies.loadIAMConfig(ctx, &cred, identityPath); err != nil {
-			switch err {
-			case errConfigNotFound:
-				// This case should not happen.
-			default:
-				// corrupt file or read error
-			}
-			continue
-		}
-
-		// If the file is already in the new format,
-		// then the parsed auth.Credentials will have
-		// the zero value for the struct.
-		var zeroCred auth.Credentials
-		if cred.Equal(zeroCred) {
-			// nothing to do
-			continue
-		}
-
-		// Found a id file in old format. Copy value
-		// into new format and save it.
-		cred.AccessKey = user
-		u := newUserIdentity(cred)
-		if err := ies.saveIAMConfig(ctx, u, identityPath); err != nil {
-			logger.LogIf(ctx, err)
-			return err
-		}
-
-		// Nothing to delete as identity file location
-		// has not changed.
-	}
-	return nil
-}
-
-func (ies *IAMEtcdStore) migrateToV1(ctx context.Context) error {
-	var iamFmt iamFormat
-	path := getIAMFormatFilePath()
-	if err := ies.loadIAMConfig(ctx, &iamFmt, path); err != nil {
-		switch err {
-		case errConfigNotFound:
-			// Need to migrate to V1.
-		default:
-			// if IAM format
-			return err
-		}
-	}
-
-	if iamFmt.Version >= iamFormatVersion1 {
-		// Nothing to do.
-		return nil
-	}
-
-	if err := ies.migrateUsersConfigToV1(ctx); err != nil {
-		logger.LogIf(ctx, err)
-		return err
-	}
-
-	// Save iam format to version 1.
-	if err := ies.saveIAMConfig(ctx, newIAMFormatVersion1(), path); err != nil {
-		logger.LogIf(ctx, err)
-		return err
-	}
-
-	return nil
-}
-
-// Should be called under config migration lock
-func (ies *IAMEtcdStore) migrateBackendFormat(ctx context.Context) error {
-	ies.Lock()
-	defer ies.Unlock()
-	return ies.migrateToV1(ctx)
+func (ies *IAMEtcdStore) loadPolicyDocWithRetry(ctx context.Context, policy string, m map[string]PolicyDoc, _ int) error {
+	return ies.loadPolicyDoc(ctx, policy, m)
 }
 
 func (ies *IAMEtcdStore) loadPolicyDoc(ctx context.Context, policy string, m map[string]PolicyDoc) error {
@@ -329,14 +198,14 @@ func (ies *IAMEtcdStore) loadPolicyDocs(ctx context.Context, m map[string]Policy
 
 	// Parse all values to construct the policies data model.
 	for _, kvs := range r.Kvs {
-		if err = ies.getPolicyDocKV(ctx, kvs, m); err != nil && err != errNoSuchPolicy {
+		if err = ies.getPolicyDocKV(ctx, kvs, m); err != nil && !errors.Is(err, errNoSuchPolicy) {
 			return err
 		}
 	}
 	return nil
 }
 
-func (ies *IAMEtcdStore) getUserKV(ctx context.Context, userkv *mvccpb.KeyValue, userType IAMUserType, m map[string]auth.Credentials, basePrefix string) error {
+func (ies *IAMEtcdStore) getUserKV(ctx context.Context, userkv *mvccpb.KeyValue, userType IAMUserType, m map[string]UserIdentity, basePrefix string) error {
 	var u UserIdentity
 	err := getIAMConfig(&u, userkv.Value, string(userkv.Key))
 	if err != nil {
@@ -349,7 +218,7 @@ func (ies *IAMEtcdStore) getUserKV(ctx context.Context, userkv *mvccpb.KeyValue,
 	return ies.addUser(ctx, user, userType, u, m)
 }
 
-func (ies *IAMEtcdStore) addUser(ctx context.Context, user string, userType IAMUserType, u UserIdentity, m map[string]auth.Credentials) error {
+func (ies *IAMEtcdStore) addUser(ctx context.Context, user string, userType IAMUserType, u UserIdentity, m map[string]UserIdentity) error {
 	if u.Credentials.IsExpired() {
 		// Delete expired identity.
 		deleteKeyEtcd(ctx, ies.client, getUserIdentityPath(user, userType))
@@ -359,11 +228,40 @@ func (ies *IAMEtcdStore) addUser(ctx context.Context, user string, userType IAMU
 	if u.Credentials.AccessKey == "" {
 		u.Credentials.AccessKey = user
 	}
-	m[user] = u.Credentials
+	if u.Credentials.SessionToken != "" {
+		jwtClaims, err := extractJWTClaims(u)
+		if err != nil {
+			if u.Credentials.IsTemp() {
+				// We should delete such that the client can re-request
+				// for the expiring credentials.
+				deleteKeyEtcd(ctx, ies.client, getUserIdentityPath(user, userType))
+				deleteKeyEtcd(ctx, ies.client, getMappedPolicyPath(user, userType, false))
+			}
+			return nil
+		}
+		u.Credentials.Claims = jwtClaims.Map()
+	}
+	if u.Credentials.Description == "" {
+		u.Credentials.Description = u.Credentials.Comment
+	}
+
+	m[user] = u
 	return nil
 }
 
-func (ies *IAMEtcdStore) loadUser(ctx context.Context, user string, userType IAMUserType, m map[string]auth.Credentials) error {
+func (ies *IAMEtcdStore) loadSecretKey(ctx context.Context, user string, userType IAMUserType) (string, error) {
+	var u UserIdentity
+	err := ies.loadIAMConfig(ctx, &u, getUserIdentityPath(user, userType))
+	if err != nil {
+		if errors.Is(err, errConfigNotFound) {
+			return "", errNoSuchUser
+		}
+		return "", err
+	}
+	return u.Credentials.SecretKey, nil
+}
+
+func (ies *IAMEtcdStore) loadUser(ctx context.Context, user string, userType IAMUserType, m map[string]UserIdentity) error {
 	var u UserIdentity
 	err := ies.loadIAMConfig(ctx, &u, getUserIdentityPath(user, userType))
 	if err != nil {
@@ -375,7 +273,7 @@ func (ies *IAMEtcdStore) loadUser(ctx context.Context, user string, userType IAM
 	return ies.addUser(ctx, user, userType, u, m)
 }
 
-func (ies *IAMEtcdStore) loadUsers(ctx context.Context, userType IAMUserType, m map[string]auth.Credentials) error {
+func (ies *IAMEtcdStore) loadUsers(ctx context.Context, userType IAMUserType, m map[string]UserIdentity) error {
 	var basePrefix string
 	switch userType {
 	case svcUser:
@@ -438,7 +336,11 @@ func (ies *IAMEtcdStore) loadGroups(ctx context.Context, m map[string]GroupInfo)
 	return nil
 }
 
-func (ies *IAMEtcdStore) loadMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool, m map[string]MappedPolicy) error {
+func (ies *IAMEtcdStore) loadMappedPolicyWithRetry(ctx context.Context, name string, userType IAMUserType, isGroup bool, m *xsync.MapOf[string, MappedPolicy], retries int) error {
+	return ies.loadMappedPolicy(ctx, name, userType, isGroup, m)
+}
+
+func (ies *IAMEtcdStore) loadMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool, m *xsync.MapOf[string, MappedPolicy]) error {
 	var p MappedPolicy
 	err := ies.loadIAMConfig(ctx, &p, getMappedPolicyPath(name, userType, isGroup))
 	if err != nil {
@@ -447,11 +349,11 @@ func (ies *IAMEtcdStore) loadMappedPolicy(ctx context.Context, name string, user
 		}
 		return err
 	}
-	m[name] = p
+	m.Store(name, p)
 	return nil
 }
 
-func getMappedPolicy(ctx context.Context, kv *mvccpb.KeyValue, userType IAMUserType, isGroup bool, m map[string]MappedPolicy, basePrefix string) error {
+func getMappedPolicy(kv *mvccpb.KeyValue, m *xsync.MapOf[string, MappedPolicy], basePrefix string) error {
 	var p MappedPolicy
 	err := getIAMConfig(&p, kv.Value, string(kv.Key))
 	if err != nil {
@@ -461,11 +363,11 @@ func getMappedPolicy(ctx context.Context, kv *mvccpb.KeyValue, userType IAMUserT
 		return err
 	}
 	name := extractPathPrefixAndSuffix(string(kv.Key), basePrefix, ".json")
-	m[name] = p
+	m.Store(name, p)
 	return nil
 }
 
-func (ies *IAMEtcdStore) loadMappedPolicies(ctx context.Context, userType IAMUserType, isGroup bool, m map[string]MappedPolicy) error {
+func (ies *IAMEtcdStore) loadMappedPolicies(ctx context.Context, userType IAMUserType, isGroup bool, m *xsync.MapOf[string, MappedPolicy]) error {
 	cctx, cancel := context.WithTimeout(ctx, defaultContextTimeout)
 	defer cancel()
 	var basePrefix string
@@ -490,7 +392,7 @@ func (ies *IAMEtcdStore) loadMappedPolicies(ctx context.Context, userType IAMUse
 
 	// Parse all policies mapping to create the proper data model
 	for _, kv := range r.Kvs {
-		if err = getMappedPolicy(ctx, kv, userType, isGroup, m, basePrefix); err != nil && err != errNoSuchPolicy {
+		if err = getMappedPolicy(kv, m, basePrefix); err != nil && !errors.Is(err, errNoSuchPolicy) {
 			return err
 		}
 	}
@@ -568,7 +470,7 @@ func (ies *IAMEtcdStore) watch(ctx context.Context, keyPath string) <-chan iamWa
 						goto outerLoop
 					}
 					if err := watchResp.Err(); err != nil {
-						logger.LogIf(ctx, err)
+						iamLogIf(ctx, err)
 						// log and retry.
 						time.Sleep(1 * time.Second)
 						// Upon an error on watch channel
@@ -591,7 +493,6 @@ func (ies *IAMEtcdStore) watch(ctx context.Context, keyPath string) <-chan iamWa
 								keyPath:   string(event.Kv.Key),
 							}
 						}
-
 					}
 				}
 			}

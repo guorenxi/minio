@@ -22,12 +22,18 @@ package replication
 // StatusType of Replication for x-amz-replication-status header
 type StatusType string
 
+// Type - replication type enum
+type Type int
+
 const (
 	// Pending - replication is pending.
 	Pending StatusType = "PENDING"
 
 	// Completed - replication completed ok.
 	Completed StatusType = "COMPLETED"
+
+	// CompletedLegacy was called "COMPLETE" incorrectly.
+	CompletedLegacy StatusType = "COMPLETE"
 
 	// Failed - replication failed.
 	Failed StatusType = "FAILED"

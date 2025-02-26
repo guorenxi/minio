@@ -19,42 +19,25 @@ package cmd
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"net/http"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/minio/minio/internal/amztime"
+	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/bucket/replication"
+	"github.com/minio/minio/internal/crypto"
+	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/minio/internal/sync/errgroup"
+	"github.com/minio/pkg/v3/sync/errgroup"
 )
 
 // Object was stored with additional erasure codes due to degraded system at upload time
 const minIOErasureUpgraded = "x-minio-internal-erasure-upgraded"
 
 const erasureAlgorithm = "rs-vandermonde"
-
-// byObjectPartNumber is a collection satisfying sort.Interface.
-type byObjectPartNumber []ObjectPartInfo
-
-func (t byObjectPartNumber) Len() int           { return len(t) }
-func (t byObjectPartNumber) Swap(i, j int)      { t[i], t[j] = t[j], t[i] }
-func (t byObjectPartNumber) Less(i, j int) bool { return t[i].Number < t[j].Number }
-
-// AddChecksumInfo adds a checksum of a part.
-func (e *ErasureInfo) AddChecksumInfo(ckSumInfo ChecksumInfo) {
-	for i, sum := range e.Checksums {
-		if sum.PartNumber == ckSumInfo.PartNumber {
-			e.Checksums[i] = ckSumInfo
-			return
-		}
-	}
-	e.Checksums = append(e.Checksums, ckSumInfo)
-}
 
 // GetChecksumInfo - get checksum of a part.
 func (e ErasureInfo) GetChecksumInfo(partNumber int) (ckSum ChecksumInfo) {
@@ -64,7 +47,7 @@ func (e ErasureInfo) GetChecksumInfo(partNumber int) (ckSum ChecksumInfo) {
 			return sum
 		}
 	}
-	return ChecksumInfo{}
+	return ChecksumInfo{Algorithm: DefaultBitrotAlgorithm}
 }
 
 // ShardFileSize - returns final erasure size from original size.
@@ -99,15 +82,15 @@ func (fi FileInfo) IsValid() bool {
 		fi.Erasure.Index <= dataBlocks+parityBlocks &&
 		len(fi.Erasure.Distribution) == (dataBlocks+parityBlocks))
 	return ((dataBlocks >= parityBlocks) &&
-		(dataBlocks != 0) && (parityBlocks != 0) &&
+		(dataBlocks > 0) && (parityBlocks >= 0) &&
 		correctIndexes)
 }
 
 // ToObjectInfo - Converts metadata to object info.
-func (fi FileInfo) ToObjectInfo(bucket, object string) ObjectInfo {
+func (fi FileInfo) ToObjectInfo(bucket, object string, versioned bool) ObjectInfo {
 	object = decodeDirObject(object)
 	versionID := fi.VersionID
-	if (globalBucketVersioningSys.Enabled(bucket) || globalBucketVersioningSys.Suspended(bucket)) && versionID == "" {
+	if versioned && versionID == "" {
 		versionID = nullVersionID
 	}
 
@@ -115,6 +98,8 @@ func (fi FileInfo) ToObjectInfo(bucket, object string) ObjectInfo {
 		IsDir:            HasSuffix(object, SlashSeparator),
 		Bucket:           bucket,
 		Name:             object,
+		ParityBlocks:     fi.Erasure.ParityBlocks,
+		DataBlocks:       fi.Erasure.DataBlocks,
 		VersionID:        versionID,
 		IsLatest:         fi.IsLatest,
 		DeleteMarker:     fi.Deleted,
@@ -125,19 +110,14 @@ func (fi FileInfo) ToObjectInfo(bucket, object string) ObjectInfo {
 		ContentEncoding:  fi.Metadata["content-encoding"],
 		NumVersions:      fi.NumVersions,
 		SuccessorModTime: fi.SuccessorModTime,
+		CacheControl:     fi.Metadata["cache-control"],
 	}
 
-	// Update expires
-	var (
-		t time.Time
-		e error
-	)
 	if exp, ok := fi.Metadata["expires"]; ok {
-		if t, e = time.Parse(http.TimeFormat, exp); e == nil {
+		if t, err := amztime.ParseHeader(exp); err == nil {
 			objInfo.Expires = t.UTC()
 		}
 	}
-	objInfo.backendType = BackendErasure
 
 	// Extract etag from metadata.
 	objInfo.ETag = extractETag(fi.Metadata)
@@ -151,9 +131,14 @@ func (fi FileInfo) ToObjectInfo(bucket, object string) ObjectInfo {
 	// Add replication status to the object info
 	objInfo.ReplicationStatusInternal = fi.ReplicationState.ReplicationStatusInternal
 	objInfo.VersionPurgeStatusInternal = fi.ReplicationState.VersionPurgeStatusInternal
-	objInfo.ReplicationStatus = fi.ReplicationState.CompositeReplicationStatus()
+	objInfo.ReplicationStatus = fi.ReplicationStatus()
+	if objInfo.ReplicationStatus.Empty() { // overlay x-amx-replication-status if present for replicas
+		if st, ok := fi.Metadata[xhttp.AmzBucketReplicationStatus]; ok && st == string(replication.Replica) {
+			objInfo.ReplicationStatus = replication.StatusType(st)
+		}
+	}
+	objInfo.VersionPurgeStatus = fi.VersionPurgeStatus()
 
-	objInfo.VersionPurgeStatus = fi.ReplicationState.CompositeVersionPurgeStatus()
 	objInfo.TransitionedObject = TransitionedObject{
 		Name:        fi.TransitionedObjName,
 		VersionID:   fi.TransitionVersionID,
@@ -172,13 +157,14 @@ func (fi FileInfo) ToObjectInfo(bucket, object string) ObjectInfo {
 	objInfo.Parts = fi.Parts
 
 	// Update storage class
-	if sc, ok := fi.Metadata[xhttp.AmzStorageClass]; ok {
+	if fi.TransitionTier != "" {
+		objInfo.StorageClass = fi.TransitionTier
+	} else if sc, ok := fi.Metadata[xhttp.AmzStorageClass]; ok {
 		objInfo.StorageClass = sc
 	} else {
 		objInfo.StorageClass = globalMinioDefaultStorageClass
 	}
 
-	objInfo.VersionPurgeStatus = fi.VersionPurgeStatus()
 	// set restore status for transitioned object
 	restoreHdr, ok := fi.Metadata[xhttp.AmzRestore]
 	if ok {
@@ -187,6 +173,9 @@ func (fi FileInfo) ToObjectInfo(bucket, object string) ObjectInfo {
 			objInfo.RestoreExpires, _ = restoreStatus.Expiry()
 		}
 	}
+	objInfo.Checksum = fi.Checksum
+	objInfo.decryptPartsChecksums(nil)
+	objInfo.Inlined = fi.InlineData()
 	// Success.
 	return objInfo
 }
@@ -227,6 +216,7 @@ func (fi FileInfo) ReplicationInfoEquals(ofi FileInfo) bool {
 }
 
 // objectPartIndex - returns the index of matching object part number.
+// Returns -1 if the part cannot be found.
 func objectPartIndex(parts []ObjectPartInfo, partNumber int) int {
 	for i, part := range parts {
 		if partNumber == part.Number {
@@ -236,13 +226,27 @@ func objectPartIndex(parts []ObjectPartInfo, partNumber int) int {
 	return -1
 }
 
+// objectPartIndexNums returns the index of the specified part number.
+// Returns -1 if the part cannot be found.
+func objectPartIndexNums(parts []int, partNumber int) int {
+	for i, part := range parts {
+		if part != 0 && partNumber == part {
+			return i
+		}
+	}
+	return -1
+}
+
 // AddObjectPart - add a new object part in order.
-func (fi *FileInfo) AddObjectPart(partNumber int, partETag string, partSize int64, actualSize int64) {
+func (fi *FileInfo) AddObjectPart(partNumber int, partETag string, partSize, actualSize int64, modTime time.Time, idx []byte, checksums map[string]string) {
 	partInfo := ObjectPartInfo{
 		Number:     partNumber,
 		ETag:       partETag,
 		Size:       partSize,
 		ActualSize: actualSize,
+		ModTime:    modTime,
+		Index:      idx,
+		Checksums:  checksums,
 	}
 
 	// Update part info if it already exists.
@@ -257,7 +261,7 @@ func (fi *FileInfo) AddObjectPart(partNumber int, partETag string, partSize int6
 	fi.Parts = append(fi.Parts, partInfo)
 
 	// Parts in FileInfo should be in sorted order by part number.
-	sort.Sort(byObjectPartNumber(fi.Parts))
+	sort.Slice(fi.Parts, func(i, j int) bool { return fi.Parts[i].Number < fi.Parts[j].Number })
 }
 
 // ObjectToPartOffset - translate offset of an object to offset of its individual part.
@@ -277,42 +281,57 @@ func (fi FileInfo) ObjectToPartOffset(ctx context.Context, offset int64) (partIn
 		// Continue to towards the next part.
 		partOffset -= part.Size
 	}
-	logger.LogIf(ctx, InvalidRange{})
+	internalLogIf(ctx, InvalidRange{})
 	// Offset beyond the size of the object return InvalidRange.
 	return 0, 0, InvalidRange{}
 }
 
-func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.Time, quorum int) (FileInfo, error) {
+func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.Time, etag string, quorum int) (FileInfo, error) {
 	// with less quorum return error.
-	if quorum < 2 {
-		return FileInfo{}, errErasureReadQuorum
+	if quorum < 1 {
+		return FileInfo{}, InsufficientReadQuorum{Err: errErasureReadQuorum, Type: RQInsufficientOnlineDrives}
 	}
 	metaHashes := make([]string, len(metaArr))
 	h := sha256.New()
 	for i, meta := range metaArr {
-		if meta.IsValid() && meta.ModTime.Equal(modTime) {
+		if !meta.IsValid() {
+			continue
+		}
+		etagOnly := modTime.Equal(timeSentinel) && (etag != "" && etag == meta.Metadata["etag"])
+		mtimeValid := meta.ModTime.Equal(modTime)
+		if mtimeValid || etagOnly {
 			fmt.Fprintf(h, "%v", meta.XLV1)
-			fmt.Fprintf(h, "%v", meta.GetDataDir())
 			for _, part := range meta.Parts {
 				fmt.Fprintf(h, "part.%d", part.Number)
+				fmt.Fprintf(h, "part.%d", part.Size)
 			}
-			fmt.Fprintf(h, "%v", meta.Erasure.Distribution)
-			// make sure that length of Data is same
-			fmt.Fprintf(h, "%v", len(meta.Data))
+			// Previously we checked if we had quorum on DataDir value.
+			// We have removed this check to allow reading objects with different DataDir
+			// values in a few drives (due to a rebalance-stop race bug)
+			// provided their their etags or ModTimes match.
 
-			// ILM transition fields
-			fmt.Fprint(h, meta.TransitionStatus)
-			fmt.Fprint(h, meta.TransitionTier)
-			fmt.Fprint(h, meta.TransitionedObjName)
-			fmt.Fprint(h, meta.TransitionVersionID)
+			if !meta.Deleted && meta.Size != 0 {
+				fmt.Fprintf(h, "%v+%v", meta.Erasure.DataBlocks, meta.Erasure.ParityBlocks)
+				fmt.Fprintf(h, "%v", meta.Erasure.Distribution)
+			}
 
-			// Server-side replication fields
-			fmt.Fprintf(h, "%v", meta.MarkDeleted)
-			fmt.Fprint(h, meta.Metadata[string(meta.ReplicationState.ReplicaStatus)])
-			fmt.Fprint(h, meta.Metadata[meta.ReplicationState.ReplicationTimeStamp.Format(http.TimeFormat)])
-			fmt.Fprint(h, meta.Metadata[meta.ReplicationState.ReplicaTimeStamp.Format(http.TimeFormat)])
-			fmt.Fprint(h, meta.Metadata[meta.ReplicationState.ReplicationStatusInternal])
-			fmt.Fprint(h, meta.Metadata[meta.ReplicationState.VersionPurgeStatusInternal])
+			if meta.IsRemote() {
+				// ILM transition fields
+				fmt.Fprint(h, meta.TransitionStatus)
+				fmt.Fprint(h, meta.TransitionTier)
+				fmt.Fprint(h, meta.TransitionedObjName)
+				fmt.Fprint(h, meta.TransitionVersionID)
+			}
+
+			// If metadata says encrypted, ask for it in quorum.
+			if etyp, ok := crypto.IsEncrypted(meta.Metadata); ok {
+				fmt.Fprint(h, etyp)
+			}
+
+			// If compressed, look for compressed FileInfo only
+			if meta.IsCompressed() {
+				fmt.Fprint(h, meta.Metadata[ReservedMetadataPrefix+"compression"])
+			}
 
 			metaHashes[i] = hex.EncodeToString(h.Sum(nil))
 			h.Reset()
@@ -337,39 +356,54 @@ func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.
 	}
 
 	if maxCount < quorum {
-		return FileInfo{}, errErasureReadQuorum
+		return FileInfo{}, InsufficientReadQuorum{Err: errErasureReadQuorum, Type: RQInconsistentMeta}
 	}
 
+	// objProps represents properties that go beyond a single version
+	type objProps struct {
+		succModTime time.Time
+		numVersions int
+	}
+	// Find the successor mod time and numVersions in quorum, otherwise leave the
+	// candidate as found
+	otherPropsMap := make(counterMap[objProps])
+	var candidate FileInfo
+	var found bool
 	for i, hash := range metaHashes {
 		if hash == maxHash {
 			if metaArr[i].IsValid() {
-				return metaArr[i], nil
+				if !found {
+					candidate = metaArr[i]
+					found = true
+				}
+				props := objProps{
+					succModTime: metaArr[i].SuccessorModTime,
+					numVersions: metaArr[i].NumVersions,
+				}
+				otherPropsMap[props]++
 			}
 		}
 	}
 
-	return FileInfo{}, errErasureReadQuorum
-}
-
-func pickValidDiskTimeWithQuorum(metaArr []FileInfo, quorum int) time.Time {
-	diskMTimes := listObjectDiskMtimes(metaArr)
-
-	diskMTime, diskMaxima := commonTimeAndOccurence(diskMTimes, shardDiskTimeDelta)
-	if diskMaxima >= quorum {
-		return diskMTime
+	if found {
+		// Update candidate FileInfo with succModTime and numVersions in quorum when available
+		if props, ok := otherPropsMap.GetValueWithQuorum(quorum); ok {
+			candidate.SuccessorModTime = props.succModTime
+			candidate.IsLatest = props.succModTime.IsZero()
+			candidate.NumVersions = props.numVersions
+		}
+		return candidate, nil
 	}
-
-	return timeSentinel
+	return FileInfo{}, InsufficientReadQuorum{Err: errErasureReadQuorum, Type: RQInconsistentMeta}
 }
 
 // pickValidFileInfo - picks one valid FileInfo content and returns from a
 // slice of FileInfo.
-func pickValidFileInfo(ctx context.Context, metaArr []FileInfo, modTime time.Time, quorum int) (FileInfo, error) {
-	return findFileInfoInQuorum(ctx, metaArr, modTime, quorum)
+func pickValidFileInfo(ctx context.Context, metaArr []FileInfo, modTime time.Time, etag string, quorum int) (FileInfo, error) {
+	return findFileInfoInQuorum(ctx, metaArr, modTime, etag, quorum)
 }
 
-// writeUniqueFileInfo - writes unique `xl.meta` content for each disk concurrently.
-func writeUniqueFileInfo(ctx context.Context, disks []StorageAPI, bucket, prefix string, files []FileInfo, quorum int) ([]StorageAPI, error) {
+func writeAllMetadataWithRevert(ctx context.Context, disks []StorageAPI, origbucket, bucket, prefix string, files []FileInfo, quorum int, revert bool) ([]StorageAPI, error) {
 	g := errgroup.WithNErrs(len(disks))
 
 	// Start writing `xl.meta` to all disks in parallel.
@@ -383,9 +417,9 @@ func writeUniqueFileInfo(ctx context.Context, disks []StorageAPI, bucket, prefix
 			fi := files[index]
 			fi.Erasure.Index = index + 1
 			if fi.IsValid() {
-				return disks[index].WriteMetadata(ctx, bucket, prefix, fi)
+				return disks[index].WriteMetadata(ctx, origbucket, bucket, prefix, fi)
 			}
-			return errCorruptedFormat
+			return errFileCorrupt
 		}, index)
 	}
 
@@ -393,44 +427,132 @@ func writeUniqueFileInfo(ctx context.Context, disks []StorageAPI, bucket, prefix
 	mErrs := g.Wait()
 
 	err := reduceWriteQuorumErrs(ctx, mErrs, objectOpIgnoredErrs, quorum)
+	if err != nil && revert {
+		ng := errgroup.WithNErrs(len(disks))
+		for index := range disks {
+			if mErrs[index] != nil {
+				continue
+			}
+			index := index
+			ng.Go(func() error {
+				if disks[index] == nil {
+					return errDiskNotFound
+				}
+				return disks[index].Delete(ctx, bucket, pathJoin(prefix, xlStorageFormatFile), DeleteOptions{
+					Recursive: true,
+				})
+			}, index)
+		}
+		ng.Wait()
+	}
+
 	return evalDisks(disks, mErrs), err
+}
+
+func writeAllMetadata(ctx context.Context, disks []StorageAPI, origbucket, bucket, prefix string, files []FileInfo, quorum int) ([]StorageAPI, error) {
+	return writeAllMetadataWithRevert(ctx, disks, origbucket, bucket, prefix, files, quorum, true)
+}
+
+// writeUniqueFileInfo - writes unique `xl.meta` content for each disk concurrently.
+func writeUniqueFileInfo(ctx context.Context, disks []StorageAPI, origbucket, bucket, prefix string, files []FileInfo, quorum int) ([]StorageAPI, error) {
+	return writeAllMetadataWithRevert(ctx, disks, origbucket, bucket, prefix, files, quorum, false)
+}
+
+func commonParity(parities []int, defaultParityCount int) int {
+	N := len(parities)
+
+	occMap := make(map[int]int)
+	for _, p := range parities {
+		occMap[p]++
+	}
+
+	var maxOcc, cparity int
+	for parity, occ := range occMap {
+		if parity == -1 {
+			// Ignore non defined parity
+			continue
+		}
+
+		readQuorum := N - parity
+		if defaultParityCount > 0 && parity == 0 {
+			// In this case, parity == 0 implies that this object version is a
+			// delete marker
+			readQuorum = N/2 + 1
+		}
+		if occ < readQuorum {
+			// Ignore this parity since we don't have enough shards for read quorum
+			continue
+		}
+
+		if occ > maxOcc {
+			maxOcc = occ
+			cparity = parity
+		}
+	}
+
+	if maxOcc == 0 {
+		// Did not found anything useful
+		return -1
+	}
+	return cparity
+}
+
+func listObjectParities(partsMetadata []FileInfo, errs []error) (parities []int) {
+	totalShards := len(partsMetadata)
+	parities = make([]int, len(partsMetadata))
+	for index, metadata := range partsMetadata {
+		if errs[index] != nil {
+			parities[index] = -1
+			continue
+		}
+		if !metadata.IsValid() {
+			parities[index] = -1
+			continue
+		}
+		//nolint:gocritic
+		// Delete marker or zero byte objects take highest parity.
+		if metadata.Deleted || metadata.Size == 0 {
+			parities[index] = totalShards / 2
+		} else if metadata.TransitionStatus == lifecycle.TransitionComplete {
+			// For tiered objects, read quorum is N/2+1 to ensure simple majority on xl.meta.
+			// It is not equal to EcM because the data integrity is entrusted with the warm tier.
+			// However, we never go below EcM, in case of a EcM=EcN setup.
+			parities[index] = max(totalShards-(totalShards/2+1), metadata.Erasure.ParityBlocks)
+		} else {
+			parities[index] = metadata.Erasure.ParityBlocks
+		}
+	}
+	return
 }
 
 // Returns per object readQuorum and writeQuorum
 // readQuorum is the min required disks to read data.
 // writeQuorum is the min required disks to write data.
 func objectQuorumFromMeta(ctx context.Context, partsMetaData []FileInfo, errs []error, defaultParityCount int) (objectReadQuorum, objectWriteQuorum int, err error) {
-	// get the latest updated Metadata and a count of all the latest updated FileInfo(s)
-	latestFileInfo, err := getLatestFileInfo(ctx, partsMetaData, errs)
-	if err != nil {
-		return 0, 0, err
+	// There should be at least half correct entries, if not return failure
+	expectedRQuorum := len(partsMetaData) / 2
+	if defaultParityCount == 0 {
+		// if parity count is '0', we expected all entries to be present.
+		expectedRQuorum = len(partsMetaData)
 	}
 
-	if latestFileInfo.Deleted {
-		// For delete markers do not use 'defaultParityCount' as it is not expected to be the case.
-		// Use maximum allowed read quorum instead, writeQuorum+1 is returned for compatibility sake
-		// but there are no callers that shall be using this.
-		readQuorum := len(partsMetaData) / 2
-		return readQuorum, readQuorum + 1, nil
+	reducedErr := reduceReadQuorumErrs(ctx, errs, objectOpIgnoredErrs, expectedRQuorum)
+	if reducedErr != nil {
+		return -1, -1, reducedErr
 	}
 
-	parityBlocks := globalStorageClass.GetParityForSC(latestFileInfo.Metadata[xhttp.AmzStorageClass])
-	if parityBlocks <= 0 {
-		parityBlocks = defaultParityCount
+	// special case when parity is '0'
+	if defaultParityCount == 0 {
+		return len(partsMetaData), len(partsMetaData), nil
 	}
 
-	// For erasure code upgraded objects choose the parity
-	// blocks saved internally, instead of 'defaultParityCount'
-	if _, ok := latestFileInfo.Metadata[minIOErasureUpgraded]; ok {
-		if latestFileInfo.Erasure.ParityBlocks != 0 {
-			parityBlocks = latestFileInfo.Erasure.ParityBlocks
-		}
+	parities := listObjectParities(partsMetaData, errs)
+	parityBlocks := commonParity(parities, defaultParityCount)
+	if parityBlocks < 0 {
+		return -1, -1, InsufficientReadQuorum{Err: errErasureReadQuorum, Type: RQInsufficientOnlineDrives}
 	}
 
-	dataBlocks := latestFileInfo.Erasure.DataBlocks
-	if dataBlocks == 0 {
-		dataBlocks = len(partsMetaData) - parityBlocks
-	}
+	dataBlocks := len(partsMetaData) - parityBlocks
 
 	writeQuorum := dataBlocks
 	if dataBlocks == parityBlocks {
@@ -445,6 +567,7 @@ func objectQuorumFromMeta(ctx context.Context, partsMetaData []FileInfo, errs []
 const (
 	tierFVID     = "tier-free-versionID"
 	tierFVMarker = "tier-free-marker"
+	tierSkipFVID = "tier-skip-fvid"
 )
 
 // SetTierFreeVersionID sets free-version's versionID. This method is used by
@@ -471,15 +594,49 @@ func (fi *FileInfo) SetTierFreeVersion() {
 	fi.Metadata[ReservedMetadataPrefixLower+tierFVMarker] = ""
 }
 
+// SetSkipTierFreeVersion indicates to skip adding a tier free version id.
+// Note: Used only when expiring tiered objects and the remote content has
+// already been scheduled for deletion
+func (fi *FileInfo) SetSkipTierFreeVersion() {
+	if fi.Metadata == nil {
+		fi.Metadata = make(map[string]string)
+	}
+	fi.Metadata[ReservedMetadataPrefixLower+tierSkipFVID] = ""
+}
+
+// SkipTierFreeVersion returns true if set, false otherwise.
+// See SetSkipTierVersion for its purpose.
+func (fi *FileInfo) SkipTierFreeVersion() bool {
+	_, ok := fi.Metadata[ReservedMetadataPrefixLower+tierSkipFVID]
+	return ok
+}
+
 // TierFreeVersion returns true if version is a free-version.
 func (fi *FileInfo) TierFreeVersion() bool {
 	_, ok := fi.Metadata[ReservedMetadataPrefixLower+tierFVMarker]
 	return ok
 }
 
+// IsRestoreObjReq returns true if fi corresponds to a RestoreObject request.
+func (fi *FileInfo) IsRestoreObjReq() bool {
+	if restoreHdr, ok := fi.Metadata[xhttp.AmzRestore]; ok {
+		if restoreStatus, err := parseRestoreObjStatus(restoreHdr); err == nil {
+			if !restoreStatus.Ongoing() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // VersionPurgeStatus returns overall version purge status for this object version across targets
 func (fi *FileInfo) VersionPurgeStatus() VersionPurgeStatusType {
 	return fi.ReplicationState.CompositeVersionPurgeStatus()
+}
+
+// ReplicationStatus returns overall version replication status for this object version across targets
+func (fi *FileInfo) ReplicationStatus() replication.StatusType {
+	return fi.ReplicationState.CompositeReplicationStatus()
 }
 
 // DeleteMarkerReplicationStatus returns overall replication status for this delete marker version across targets
@@ -505,11 +662,9 @@ func getInternalReplicationState(m map[string]string) ReplicationState {
 	for k, v := range m {
 		switch {
 		case equals(k, ReservedMetadataPrefixLower+ReplicationTimestamp):
-			tm, _ := time.Parse(http.TimeFormat, v)
-			d.ReplicationTimeStamp = tm
+			d.ReplicaTimeStamp, _ = amztime.ParseReplicationTS(v)
 		case equals(k, ReservedMetadataPrefixLower+ReplicaTimestamp):
-			tm, _ := time.Parse(http.TimeFormat, v)
-			d.ReplicaTimeStamp = tm
+			d.ReplicaTimeStamp, _ = amztime.ParseReplicationTS(v)
 		case equals(k, ReservedMetadataPrefixLower+ReplicaStatus):
 			d.ReplicaStatus = replication.StatusType(v)
 		case equals(k, ReservedMetadataPrefixLower+ReplicationStatus):

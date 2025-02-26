@@ -24,10 +24,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/url"
+	"os"
 	"time"
 
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
 	cr "github.com/minio/minio-go/v7/pkg/credentials"
 )
@@ -60,7 +63,7 @@ func init() {
 	flag.BoolVar(&displayCreds, "d", false, "Only show generated credentials")
 	flag.DurationVar(&expiryDuration, "e", 0, "Request a duration of validity for the generated credential")
 	flag.StringVar(&bucketToList, "b", "", "Bucket to list (defaults to username)")
-	// flag.StringVar(&sessionPolicyFile, "s", "", "File containing session policy to apply to the STS request")
+	flag.StringVar(&sessionPolicyFile, "s", "", "File containing session policy to apply to the STS request")
 }
 
 func main() {
@@ -77,21 +80,21 @@ func main() {
 	var stsOpts cr.STSAssumeRoleOptions
 	stsOpts.AccessKey = minioUsername
 	stsOpts.SecretKey = minioPassword
-	// FIXME: add support for passing this in minio-go
-	// if sessionPolicyFile != "" {
-	// 	var policy string
-	// 	if f, err := os.Open(sessionPolicyFile); err != nil {
-	// 		log.Fatalf("Unable to open session policy file: %v", sessionPolicyFile, err)
-	// 	} else {
-	// 		bs, err := ioutil.ReadAll(f)
-	// 		if err != nil {
-	// 			log.Fatalf("Error reading session policy file: %v", err)
-	// 		}
-	// 		policy = string(bs)
-	// 	}
-	// 	opts
-	// 	ldapOpts = append(ldapOpts, cr.LDAPIdentityPolicyOpt(policy))
-	// }
+
+	if sessionPolicyFile != "" {
+		var policy string
+		if f, err := os.Open(sessionPolicyFile); err != nil {
+			log.Fatalf("Unable to open session policy file: %v", err)
+		} else {
+			defer f.Close()
+			bs, err := io.ReadAll(f)
+			if err != nil {
+				log.Fatalf("Error reading session policy file: %v", err)
+			}
+			policy = string(bs)
+		}
+		stsOpts.Policy = policy
+	}
 	if expiryDuration != 0 {
 		stsOpts.DurationSeconds = int(expiryDuration.Seconds())
 	}
@@ -110,6 +113,11 @@ func main() {
 		Secure: stsEndpointURL.Scheme == "https",
 	}
 
+	mopts := &madmin.Options{
+		Creds:  li,
+		Secure: stsEndpointURL.Scheme == "https",
+	}
+
 	v, err := li.Get()
 	if err != nil {
 		log.Fatalf("Error retrieving STS credentials: %v", err)
@@ -123,10 +131,22 @@ func main() {
 		return
 	}
 
+	// API requests are secure (HTTPS) if secure=true and insecure (HTTP) otherwise.
+	// New returns an MinIO Admin client object.
+	madmClnt, err := madmin.NewWithOptions(stsEndpointURL.Host, mopts)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	err = madmClnt.ServiceRestart(context.Background())
+	if err != nil {
+		log.Fatalln(err)
+	}
+
 	// Use generated credentials to authenticate with MinIO server
 	minioClient, err := minio.New(stsEndpointURL.Host, opts)
 	if err != nil {
-		log.Fatalf("Error initializing client: ", err)
+		log.Fatalf("Error initializing client: %v", err)
 	}
 
 	// Use minIO Client object normally like the regular client.

@@ -60,7 +60,11 @@ func (h *HTTPRangeSpec) GetLength(resourceSize int64) (rangeLength int64, err er
 		}
 
 	case h.Start >= resourceSize:
-		return 0, errInvalidRange
+		return 0, InvalidRange{
+			OffsetBegin:  h.Start,
+			OffsetEnd:    h.End,
+			ResourceSize: resourceSize,
+		}
 
 	case h.End > -1:
 		end := h.End
@@ -173,4 +177,27 @@ func (h *HTTPRangeSpec) String(resourceSize int64) string {
 		return ""
 	}
 	return fmt.Sprintf("%d-%d", off, off+length-1)
+}
+
+// ToHeader returns the Range header value.
+func (h *HTTPRangeSpec) ToHeader() (string, error) {
+	if h == nil {
+		return "", nil
+	}
+	start := strconv.Itoa(int(h.Start))
+	end := strconv.Itoa(int(h.End))
+	switch {
+	case h.Start >= 0 && h.End >= 0:
+		if h.Start > h.End {
+			return "", errInvalidRange
+		}
+	case h.IsSuffixLength:
+		end = strconv.Itoa(int(h.Start * -1))
+		start = ""
+	case h.Start > -1:
+		end = ""
+	default:
+		return "", errors.New("does not have valid range value")
+	}
+	return fmt.Sprintf("bytes=%s-%s", start, end), nil
 }

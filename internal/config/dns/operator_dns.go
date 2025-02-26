@@ -63,14 +63,14 @@ func (c *OperatorDNS) addAuthHeader(r *http.Request) error {
 	return nil
 }
 
-func (c *OperatorDNS) endpoint(bucket string, delete bool) (string, error) {
+func (c *OperatorDNS) endpoint(bucket string, del bool) (string, error) {
 	u, err := url.Parse(c.Endpoint)
 	if err != nil {
 		return "", err
 	}
 	q := u.Query()
 	q.Add("bucket", bucket)
-	q.Add("delete", strconv.FormatBool(delete))
+	q.Add("delete", strconv.FormatBool(del))
 	u.RawQuery = q.Encode()
 	return u.String(), nil
 }
@@ -104,8 +104,7 @@ func (c *OperatorDNS) Put(bucket string) error {
 		var errorStringBuilder strings.Builder
 		io.Copy(&errorStringBuilder, io.LimitReader(resp.Body, resp.ContentLength))
 		errorString := errorStringBuilder.String()
-		switch resp.StatusCode {
-		case http.StatusConflict:
+		if resp.StatusCode == http.StatusConflict {
 			return ErrBucketConflict(Error{bucket, errors.New(errorString)})
 		}
 		return newError(bucket, fmt.Errorf("service create for bucket %s, failed with status %s, error %s", bucket, resp.Status, errorString))
@@ -155,7 +154,6 @@ func (c *OperatorDNS) DeleteRecord(record SrvRecord) error {
 
 // Close closes the internal http client
 func (c *OperatorDNS) Close() error {
-	c.httpClient.CloseIdleConnections()
 	return nil
 }
 

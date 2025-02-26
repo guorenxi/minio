@@ -62,13 +62,15 @@ func TestIsXLMetaErasureInfoValid(t *testing.T) {
 		{1, 5, 6, false},
 		{2, 5, 5, true},
 		{3, 0, 5, false},
-		{4, 5, 0, false},
-		{5, 5, 0, false},
-		{6, 5, 4, true},
+		{3, -1, 5, false},
+		{4, 5, -1, false},
+		{5, 5, 0, true},
+		{6, 5, 0, true},
+		{7, 5, 4, true},
 	}
 	for _, tt := range tests {
 		if got := isXLMetaErasureInfoValid(tt.data, tt.parity); got != tt.want {
-			t.Errorf("Test %d: Expected %v but received %v", tt.name, got, tt.want)
+			t.Errorf("Test %d: Expected %v but received %v -> %#v", tt.name, got, tt.want, tt)
 		}
 	}
 }
@@ -145,7 +147,7 @@ func getSampleXLMeta(totalParts int) xlMetaV1Object {
 
 // Compare the unmarshaled XLMetaV1 with the one obtained from jsoniter parsing.
 func compareXLMetaV1(t *testing.T, unMarshalXLMeta, jsoniterXLMeta xlMetaV1Object) {
-	// Start comparing the fields of xlMetaV1Object obtained from jsoniter parsing with one parsed using json unmarshaling.
+	// Start comparing the fields of xlMetaV1Object obtained from jsoniter parsing with one parsed using json unmarshalling.
 	if unMarshalXLMeta.Version != jsoniterXLMeta.Version {
 		t.Errorf("Expected the Version to be \"%s\", but got \"%s\".", unMarshalXLMeta.Version, jsoniterXLMeta.Version)
 	}
@@ -223,7 +225,6 @@ func compareXLMetaV1(t *testing.T, unMarshalXLMeta, jsoniterXLMeta xlMetaV1Objec
 		if val != jsoniterVal {
 			t.Errorf("Expected the value for Meta data key \"%s\" to be \"%s\", but got \"%s\".", key, val, jsoniterVal)
 		}
-
 	}
 }
 
@@ -433,7 +434,7 @@ func BenchmarkXlMetaV2Shallow(b *testing.B) {
 					// Update a random version.
 					fi.VersionID = ids[rng.Intn(size)]
 					// Delete...
-					_, _, err = xl.DeleteVersion(fi)
+					_, err = xl.DeleteVersion(fi)
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -483,7 +484,7 @@ func BenchmarkXlMetaV2Shallow(b *testing.B) {
 						b.Fatal(err)
 					}
 					// List...
-					_, err = xl.ToFileInfo("volume", "path", ids[rng.Intn(size)])
+					_, err = xl.ToFileInfo("volume", "path", ids[rng.Intn(size)], false, true)
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -501,7 +502,7 @@ func BenchmarkXlMetaV2Shallow(b *testing.B) {
 						b.Fatal(err)
 					}
 					// List...
-					_, err = xl.ListVersions("volume", "path")
+					_, err = xl.ListVersions("volume", "path", true)
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -512,11 +513,11 @@ func BenchmarkXlMetaV2Shallow(b *testing.B) {
 				b.ResetTimer()
 				b.ReportAllocs()
 				for i := 0; i < b.N; i++ {
-					buf, _ := isIndexedMetaV2(enc)
+					buf, _, _ := isIndexedMetaV2(enc)
 					if buf == nil {
 						b.Fatal("buf == nil")
 					}
-					_, err = buf.ToFileInfo("volume", "path", ids[rng.Intn(size)])
+					_, err = buf.ToFileInfo("volume", "path", ids[rng.Intn(size)], true)
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -527,11 +528,11 @@ func BenchmarkXlMetaV2Shallow(b *testing.B) {
 				b.ResetTimer()
 				b.ReportAllocs()
 				for i := 0; i < b.N; i++ {
-					buf, _ := isIndexedMetaV2(enc)
+					buf, _, _ := isIndexedMetaV2(enc)
 					if buf == nil {
 						b.Fatal("buf == nil")
 					}
-					_, err = buf.ListVersions("volume", "path")
+					_, err = buf.ListVersions("volume", "path", true)
 					if err != nil {
 						b.Fatal(err)
 					}
