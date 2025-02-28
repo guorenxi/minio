@@ -130,7 +130,6 @@ func TestDynamicTimeoutConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 100; i++ {
-				timeout.LogFailure()
 				for j := 0; j < 100; j++ {
 					timeout.LogSuccess(time.Duration(float64(time.Second) * rng.Float64()))
 				}
@@ -168,7 +167,6 @@ func testDynamicTimeoutAdjust(t *testing.T, timeout *dynamicTimeout, f func() fl
 	const successTimeout = 20 * time.Second
 
 	for i := 0; i < dynamicTimeoutLogSize; i++ {
-
 		rnd := f()
 		duration := time.Duration(float64(successTimeout) * rnd)
 

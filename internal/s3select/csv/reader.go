@@ -27,25 +27,26 @@ import (
 	"unicode/utf8"
 
 	csv "github.com/minio/csvparser"
+	"github.com/minio/minio/internal/bpool"
 	"github.com/minio/minio/internal/s3select/sql"
 )
 
 // Reader - CSV record reader for S3Select.
 type Reader struct {
 	args         *ReaderArgs
-	readCloser   io.ReadCloser    // raw input
-	buf          *bufio.Reader    // input to the splitter
-	columnNames  []string         // names of columns
-	nameIndexMap map[string]int64 // name to column index
-	current      [][]string       // current block of results to be returned
-	recordsRead  int              // number of records read in current slice
-	input        chan *queueItem  // input for workers
-	queue        chan *queueItem  // output from workers in order
-	err          error            // global error state, only touched by Reader.Read
-	bufferPool   sync.Pool        // pool of []byte objects for input
-	csvDstPool   sync.Pool        // pool of [][]string used for output
-	close        chan struct{}    // used for shutting down the splitter before end of stream
-	readerWg     sync.WaitGroup   // used to keep track of async reader.
+	readCloser   io.ReadCloser          // raw input
+	buf          *bufio.Reader          // input to the splitter
+	columnNames  []string               // names of columns
+	nameIndexMap map[string]int64       // name to column index
+	current      [][]string             // current block of results to be returned
+	recordsRead  int                    // number of records read in current slice
+	input        chan *queueItem        // input for workers
+	queue        chan *queueItem        // output from workers in order
+	err          error                  // global error state, only touched by Reader.Read
+	bufferPool   bpool.Pool[[]byte]     // pool of []byte objects for input
+	csvDstPool   bpool.Pool[[][]string] // pool of [][]string used for output
+	close        chan struct{}          // used for shutting down the splitter before end of stream
+	readerWg     sync.WaitGroup         // used to keep track of async reader.
 }
 
 // queueItem is an item in the queue.
@@ -69,7 +70,7 @@ func (r *Reader) Read(dst sql.Record) (sql.Record, error) {
 			r.err = io.EOF
 			return nil, r.err
 		}
-		//lint:ignore SA6002 Using pointer would allocate more since we would have to copy slice header before taking a pointer.
+
 		r.csvDstPool.Put(r.current)
 		r.current = <-item.dst
 		r.err = item.err
@@ -182,12 +183,12 @@ func (r *Reader) startReaders(newReader func(io.Reader) *csv.Reader) error {
 		}
 	}
 
-	r.bufferPool.New = func() interface{} {
+	r.bufferPool.New = func() []byte {
 		return make([]byte, csvSplitSize+1024)
 	}
 
 	// Return first block
-	next, nextErr := r.nextSplit(csvSplitSize, r.bufferPool.Get().([]byte))
+	next, nextErr := r.nextSplit(csvSplitSize, r.bufferPool.Get())
 	// Check if first block is valid.
 	if !utf8.Valid(next) {
 		return errInvalidTextEncodingError()
@@ -224,7 +225,7 @@ func (r *Reader) startReaders(newReader func(io.Reader) *csv.Reader) error {
 				// Exit on any error.
 				return
 			}
-			next, nextErr = r.nextSplit(csvSplitSize, r.bufferPool.Get().([]byte))
+			next, nextErr = r.nextSplit(csvSplitSize, r.bufferPool.Get())
 		}
 	}()
 
@@ -236,8 +237,8 @@ func (r *Reader) startReaders(newReader func(io.Reader) *csv.Reader) error {
 					in.dst <- nil
 					continue
 				}
-				dst, ok := r.csvDstPool.Get().([][]string)
-				if !ok {
+				dst := r.csvDstPool.Get()
+				if len(dst) < 1000 {
 					dst = make([][]string, 0, 1000)
 				}
 
@@ -269,7 +270,7 @@ func (r *Reader) startReaders(newReader func(io.Reader) *csv.Reader) error {
 					in.err = err
 				}
 				// We don't need the input any more.
-				//lint:ignore SA6002 Using pointer would allocate more since we would have to copy slice header before taking a pointer.
+				//nolint:staticcheck // SA6002 Using pointer would allocate more since we would have to copy slice header before taking a pointer.
 				r.bufferPool.Put(in.input)
 				in.input = nil
 				in.dst <- all
@@ -307,7 +308,7 @@ func NewReader(readCloser io.ReadCloser, args *ReaderArgs) (*Reader, error) {
 		ret.Comment = []rune(args.CommentCharacter)[0]
 		ret.Quote = []rune{}
 		if len([]rune(args.QuoteCharacter)) > 0 {
-			// Add the first rune of args.QuoteChracter
+			// Add the first rune of args.QuoteCharacter
 			ret.Quote = append(ret.Quote, []rune(args.QuoteCharacter)[0])
 		}
 		ret.QuoteEscape = []rune(args.QuoteEscapeCharacter)[0]

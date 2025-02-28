@@ -38,13 +38,13 @@ func TestParseAndValidateReplicationConfig(t *testing.T) {
 			expectedParsingErr:    nil,
 			expectedValidationErr: errInvalidDeleteMarkerReplicationStatus,
 		},
-		// 2 Invalid delete replication status in replication config
+		// 2 No delete replication status in replication config
 		{
 			inputConfig:           `<ReplicationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Role>arn:aws:iam::AcctID:role/role-name</Role><Rule><Status>Enabled</Status><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication><Prefix>key-prefix</Prefix><Destination><Bucket>arn:aws:s3:::destinationbucket</Bucket></Destination></Rule></ReplicationConfiguration>`,
 			destBucket:            "destinationbucket",
 			sameTarget:            false,
 			expectedParsingErr:    nil,
-			expectedValidationErr: errDeleteReplicationMissing,
+			expectedValidationErr: nil,
 		},
 		// 3 valid replication config
 		{
@@ -250,12 +250,12 @@ func TestReplicate(t *testing.T) {
 		{ObjectOpts{Name: "c1test"}, cfgs[0], true},                   // 2. valid ObjectOpts passing empty Filter
 		{ObjectOpts{Name: "c1test", VersionID: "vid"}, cfgs[0], true}, // 3. valid ObjectOpts passing empty Filter
 
-		{ObjectOpts{Name: "c1test", DeleteMarker: true, OpType: DeleteReplicationType}, cfgs[0], true},                                // 4. DeleteMarker version replication valid case - matches DeleteMarkerReplication status
-		{ObjectOpts{Name: "c1test", VersionID: "vid", OpType: DeleteReplicationType}, cfgs[0], true},                                  // 5. permanent delete of version, matches DeleteReplication status - valid case
-		{ObjectOpts{Name: "c1test", VersionID: "vid", DeleteMarker: true, OpType: DeleteReplicationType}, cfgs[0], true},              // 6. permanent delete of version, matches DeleteReplication status
-		{ObjectOpts{Name: "c1test", VersionID: "vid", DeleteMarker: true, SSEC: true, OpType: DeleteReplicationType}, cfgs[0], false}, // 7. permanent delete of version, disqualified by SSE-C
-		{ObjectOpts{Name: "c1test", DeleteMarker: true, SSEC: true, OpType: DeleteReplicationType}, cfgs[0], false},                   // 8. setting DeleteMarker on SSE-C encrypted object, disqualified by SSE-C
-		{ObjectOpts{Name: "c1test", SSEC: true}, cfgs[0], false},                                                                      // 9. replication of SSE-C encrypted object, disqualified
+		{ObjectOpts{Name: "c1test", DeleteMarker: true, OpType: DeleteReplicationType}, cfgs[0], true},                               // 4. DeleteMarker version replication valid case - matches DeleteMarkerReplication status
+		{ObjectOpts{Name: "c1test", VersionID: "vid", OpType: DeleteReplicationType}, cfgs[0], true},                                 // 5. permanent delete of version, matches DeleteReplication status - valid case
+		{ObjectOpts{Name: "c1test", VersionID: "vid", DeleteMarker: true, OpType: DeleteReplicationType}, cfgs[0], true},             // 6. permanent delete of version, matches DeleteReplication status
+		{ObjectOpts{Name: "c1test", VersionID: "vid", DeleteMarker: true, SSEC: true, OpType: DeleteReplicationType}, cfgs[0], true}, // 7. permanent delete of version
+		{ObjectOpts{Name: "c1test", DeleteMarker: true, SSEC: true, OpType: DeleteReplicationType}, cfgs[0], true},                   // 8. setting DeleteMarker on SSE-C encrypted object
+		{ObjectOpts{Name: "c1test", SSEC: true}, cfgs[0], true},                                                                      // 9. replication of SSE-C encrypted object
 
 		//  using config 2 - no filters, only replication of object, metadata enabled
 		{ObjectOpts{Name: "c2test"}, cfgs[1], true},                                                                                   // 10. valid ObjectOpts passing empty Filter
@@ -264,7 +264,7 @@ func TestReplicate(t *testing.T) {
 		{ObjectOpts{Name: "c2test", VersionID: "vid", DeleteMarker: true, OpType: DeleteReplicationType}, cfgs[1], false},             // 13. permanent delete of DeleteMarker version, disallowed by DeleteReplication status
 		{ObjectOpts{Name: "c2test", VersionID: "vid", DeleteMarker: true, SSEC: true, OpType: DeleteReplicationType}, cfgs[1], false}, // 14. permanent delete of version, disqualified by SSE-C & DeleteReplication status
 		{ObjectOpts{Name: "c2test", DeleteMarker: true, SSEC: true, OpType: DeleteReplicationType}, cfgs[1], false},                   // 15. setting DeleteMarker on SSE-C encrypted object, disqualified by SSE-C & DeleteMarkerReplication status
-		{ObjectOpts{Name: "c2test", SSEC: true}, cfgs[1], false},                                                                      // 16. replication of SSE-C encrypted object, disqualified by default
+		{ObjectOpts{Name: "c2test", SSEC: true}, cfgs[1], true},                                                                       // 16. replication of SSE-C encrypted object
 		// using config 2 - has more than one rule with overlapping prefixes
 		{ObjectOpts{Name: "xy/c3test", UserTags: "k1=v1"}, cfgs[2], true},                                                                       // 17. matches rule 1 for replication of content/metadata
 		{ObjectOpts{Name: "xyz/c3test", UserTags: "k1=v1"}, cfgs[2], true},                                                                      // 18. matches rule 1 for replication of content/metadata
@@ -295,12 +295,14 @@ func TestReplicate(t *testing.T) {
 		{ObjectOpts{Name: "xa/c5test", UserTags: "k1=v1", Replica: false}, cfgs[4], true}, // 40. replica syncing disabled, this object is NOT a replica
 	}
 
-	for i, testCase := range testCases {
-		result := testCase.c.Replicate(testCase.opts)
-
-		if result != testCase.expectedResult {
-			t.Fatalf("case %v: expected: %v, got: %v", i+1, testCase.expectedResult, result)
-		}
+	for _, testCase := range testCases {
+		testCase := testCase
+		t.Run(testCase.opts.Name, func(t *testing.T) {
+			result := testCase.c.Replicate(testCase.opts)
+			if result != testCase.expectedResult {
+				t.Errorf("expected: %v, got: %v", testCase.expectedResult, result)
+			}
+		})
 	}
 }
 
@@ -363,7 +365,6 @@ func TestHasActiveRules(t *testing.T) {
 				t.Fatalf("Expected result with recursive set to true: `%v`, got: `%v`", tc.expectedRec, got)
 			}
 		})
-
 	}
 }
 

@@ -62,6 +62,12 @@ func ParseConfig(reader io.Reader) (*Config, error) {
 				},
 			}
 		}
+		// Default DeleteReplication to disabled if unset.
+		if len(config.Rules[i].DeleteReplication.Status) == 0 {
+			config.Rules[i].DeleteReplication = DeleteReplication{
+				Status: Disabled,
+			}
+		}
 	}
 	return &config, nil
 }
@@ -112,9 +118,6 @@ func (c Config) Validate(bucket string, sameTarget bool) error {
 	return nil
 }
 
-// Type - replication type enum
-type Type int
-
 // Types of replication
 const (
 	UnsetReplicationType Type = 0 + iota
@@ -124,11 +127,21 @@ const (
 	HealReplicationType
 	ExistingObjectReplicationType
 	ResyncReplicationType
+	AllReplicationType
 )
 
 // Valid returns true if replication type is set
 func (t Type) Valid() bool {
 	return t > 0
+}
+
+// IsDataReplication returns true if content being replicated
+func (t Type) IsDataReplication() bool {
+	switch t {
+	case ObjectReplicationType, HealReplicationType, ExistingObjectReplicationType:
+		return true
+	}
+	return false
 }
 
 // ObjectOpts provides information to deduce whether replication
@@ -145,10 +158,25 @@ type ObjectOpts struct {
 	TargetArn      string
 }
 
+// HasExistingObjectReplication returns true if any of the rule returns 'ExistingObjects' replication.
+func (c Config) HasExistingObjectReplication(arn string) (hasARN, isEnabled bool) {
+	for _, rule := range c.Rules {
+		if rule.Destination.ARN == arn || c.RoleArn == arn {
+			if !hasARN {
+				hasARN = true
+			}
+			if rule.ExistingObjectReplication.Status == Enabled {
+				return true, true
+			}
+		}
+	}
+	return hasARN, false
+}
+
 // FilterActionableRules returns the rules actions that need to be executed
 // after evaluating prefix/tag filtering
 func (c Config) FilterActionableRules(obj ObjectOpts) []Rule {
-	if obj.Name == "" && obj.OpType != ResyncReplicationType {
+	if obj.Name == "" && !(obj.OpType == ResyncReplicationType || obj.OpType == AllReplicationType) {
 		return nil
 	}
 	var rules []Rule
@@ -160,8 +188,8 @@ func (c Config) FilterActionableRules(obj ObjectOpts) []Rule {
 		if obj.TargetArn != "" && rule.Destination.ARN != obj.TargetArn && c.RoleArn != obj.TargetArn {
 			continue
 		}
-		// Ignore other object level and prefix filters for resyncing target
-		if obj.OpType == ResyncReplicationType {
+		// Ignore other object level and prefix filters for resyncing target/listing bucket targets
+		if obj.OpType == ResyncReplicationType || obj.OpType == AllReplicationType {
 			rules = append(rules, rule)
 			continue
 		}
@@ -171,7 +199,7 @@ func (c Config) FilterActionableRules(obj ObjectOpts) []Rule {
 		if !strings.HasPrefix(obj.Name, rule.Prefix()) {
 			continue
 		}
-		if rule.Filter.TestTags(strings.Split(obj.UserTags, "&")) {
+		if rule.Filter.TestTags(obj.UserTags) {
 			rules = append(rules, rule)
 		}
 	}
@@ -192,9 +220,6 @@ func (c Config) GetDestination() Destination {
 
 // Replicate returns true if the object should be replicated.
 func (c Config) Replicate(obj ObjectOpts) bool {
-	if obj.SSEC {
-		return false
-	}
 	for _, rule := range c.FilterActionableRules(obj) {
 		if rule.Status == Disabled {
 			continue

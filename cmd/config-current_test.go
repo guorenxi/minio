@@ -26,7 +26,10 @@ import (
 )
 
 func TestServerConfig(t *testing.T) {
-	objLayer, fsDir, err := prepareFS()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	objLayer, fsDir, err := prepareFS(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,8 +39,8 @@ func TestServerConfig(t *testing.T) {
 		t.Fatalf("Init Test config failed")
 	}
 
-	if globalSite.Region != globalMinioDefaultRegion {
-		t.Errorf("Expecting region `us-east-1` found %s", globalSite.Region)
+	if globalSite.Region() != globalMinioDefaultRegion {
+		t.Errorf("Expecting region `us-east-1` found %s", globalSite.Region())
 	}
 
 	// Set new region and verify.
@@ -49,8 +52,8 @@ func TestServerConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if site.Region != "us-west-1" {
-		t.Errorf("Expecting region `us-west-1` found %s", globalSite.Region)
+	if site.Region() != "us-west-1" {
+		t.Errorf("Expecting region `us-west-1` found %s", globalSite.Region())
 	}
 
 	if err := saveServerConfig(context.Background(), objLayer, globalServerConfig); err != nil {
@@ -58,7 +61,7 @@ func TestServerConfig(t *testing.T) {
 	}
 
 	// Initialize server config.
-	if err := loadConfig(objLayer); err != nil {
+	if err := loadConfig(objLayer, nil); err != nil {
 		t.Fatalf("Unable to initialize from updated config file %s", err)
 	}
 }

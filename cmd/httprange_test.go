@@ -72,7 +72,7 @@ func TestHTTPRequestRangeSpec(t *testing.T) {
 		if err == nil {
 			t.Errorf("Case %d: Did not get an expected error - got %v", i, rs)
 		}
-		if err == errInvalidRange {
+		if isErrInvalidRange(err) {
 			t.Errorf("Case %d: Got invalid range error instead of a parse error", i)
 		}
 		if rs != nil {
@@ -95,9 +95,52 @@ func TestHTTPRequestRangeSpec(t *testing.T) {
 		if err1 == nil {
 			o, l, err2 = rs.GetOffsetLength(resourceSize)
 		}
-		if err1 == errInvalidRange || (err1 == nil && err2 == errInvalidRange) {
+		if isErrInvalidRange(err1) || (err1 == nil && isErrInvalidRange(err2)) {
 			continue
 		}
 		t.Errorf("Case %d: Expected errInvalidRange but: %v %v %d %d %v", i, rs, err1, o, l, err2)
+	}
+}
+
+func TestHTTPRequestRangeToHeader(t *testing.T) {
+	validRangeSpecs := []struct {
+		spec        string
+		errExpected bool
+	}{
+		{"bytes=0-", false},
+		{"bytes=1-", false},
+
+		{"bytes=0-9", false},
+		{"bytes=1-10", false},
+		{"bytes=1-1", false},
+		{"bytes=2-5", false},
+
+		{"bytes=-5", false},
+		{"bytes=-1", false},
+		{"bytes=-1000", false},
+		{"bytes=", true},
+		{"bytes= ", true},
+		{"byte=", true},
+		{"bytes=A-B", true},
+		{"bytes=1-B", true},
+		{"bytes=B-1", true},
+		{"bytes=-1-1", true},
+	}
+	for i, testCase := range validRangeSpecs {
+		rs, err := parseRequestRangeSpec(testCase.spec)
+		if err != nil {
+			if !testCase.errExpected || err == nil && testCase.errExpected {
+				t.Errorf("unexpected err: %v", err)
+			}
+			continue
+		}
+		h, err := rs.ToHeader()
+		if err != nil && !testCase.errExpected || err == nil && testCase.errExpected {
+			t.Errorf("expected error with invalid range: %v", err)
+		}
+		if h != testCase.spec {
+			t.Errorf("Case %d: translated to incorrect header: %s expected: %s",
+				i, h, testCase.spec)
+		}
 	}
 }

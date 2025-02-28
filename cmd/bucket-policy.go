@@ -27,22 +27,25 @@ import (
 
 	jsoniter "github.com/json-iterator/go"
 	miniogopolicy "github.com/minio/minio-go/v7/pkg/policy"
+	"github.com/minio/minio-go/v7/pkg/tags"
+	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/handlers"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/bucket/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 // PolicySys - policy subsystem.
 type PolicySys struct{}
 
 // Get returns stored bucket policy
-func (sys *PolicySys) Get(bucket string) (*policy.Policy, error) {
-	return globalBucketMetadataSys.GetPolicyConfig(bucket)
+func (sys *PolicySys) Get(bucket string) (*policy.BucketPolicy, error) {
+	policy, _, err := globalBucketMetadataSys.GetPolicyConfig(bucket)
+	return policy, err
 }
 
 // IsAllowed - checks given policy args is allowed to continue the Rest API.
-func (sys *PolicySys) IsAllowed(args policy.Args) bool {
+func (sys *PolicySys) IsAllowed(args policy.BucketPolicyArgs) bool {
 	p, err := sys.Get(args.BucketName)
 	if err == nil {
 		return p.IsAllowed(args)
@@ -50,7 +53,7 @@ func (sys *PolicySys) IsAllowed(args policy.Args) bool {
 
 	// Log unhandled errors.
 	if _, ok := err.(BucketPolicyNotFound); !ok {
-		logger.LogIf(GlobalContext, err)
+		internalLogIf(GlobalContext, err, logger.WarningKind)
 	}
 
 	// As policy is not available for given bucket name, returns IsOwner i.e.
@@ -63,8 +66,27 @@ func NewPolicySys() *PolicySys {
 	return &PolicySys{}
 }
 
-func getConditionValues(r *http.Request, lc string, username string, claims map[string]interface{}) map[string][]string {
+func getSTSConditionValues(r *http.Request, lc string, cred auth.Credentials) map[string][]string {
+	m := make(map[string][]string)
+	if d := r.Form.Get("DurationSeconds"); d != "" {
+		m["DurationSeconds"] = []string{d}
+	}
+	return m
+}
+
+func getConditionValues(r *http.Request, lc string, cred auth.Credentials) map[string][]string {
 	currTime := UTCNow()
+
+	var (
+		username = cred.AccessKey
+		claims   = cred.Claims
+		groups   = cred.Groups
+	)
+
+	if cred.IsTemp() || cred.IsServiceAccount() {
+		// For derived credentials, check the parent user's permissions.
+		username = cred.ParentUser
+	}
 
 	principalType := "Anonymous"
 	if username != "" {
@@ -107,7 +129,7 @@ func getConditionValues(r *http.Request, lc string, username string, claims map[
 		"CurrentTime":      {currTime.Format(time.RFC3339)},
 		"EpochTime":        {strconv.FormatInt(currTime.Unix(), 10)},
 		"SecureTransport":  {strconv.FormatBool(r.TLS != nil)},
-		"SourceIp":         {handlers.GetSourceIP(r)},
+		"SourceIp":         {handlers.GetSourceIPRaw(r)},
 		"UserAgent":        {r.UserAgent()},
 		"Referer":          {r.Referer()},
 		"principaltype":    {principalType},
@@ -123,6 +145,24 @@ func getConditionValues(r *http.Request, lc string, username string, claims map[
 	}
 
 	cloneHeader := r.Header.Clone()
+	if v := cloneHeader.Get("x-amz-signature-age"); v != "" {
+		args["signatureAge"] = []string{v}
+		cloneHeader.Del("x-amz-signature-age")
+	}
+
+	if userTags := cloneHeader.Get(xhttp.AmzObjectTagging); userTags != "" {
+		tag, _ := tags.ParseObjectTags(userTags)
+		if tag != nil {
+			tagMap := tag.ToMap()
+			keys := make([]string, 0, len(tagMap))
+			for k, v := range tagMap {
+				args[pathJoin("ExistingObjectTag", k)] = []string{v}
+				args[pathJoin("RequestObjectTag", k)] = []string{v}
+				keys = append(keys, k)
+			}
+			args["RequestObjectTagKeys"] = keys
+		}
+	}
 
 	for _, objLock := range []string{
 		xhttp.AmzObjectLockMode,
@@ -136,6 +176,9 @@ func getConditionValues(r *http.Request, lc string, username string, claims map[
 	}
 
 	for key, values := range cloneHeader {
+		if strings.EqualFold(key, xhttp.AmzObjectTagging) {
+			continue
+		}
 		if existingValues, found := args[key]; found {
 			args[key] = append(existingValues, values...)
 		} else {
@@ -168,18 +211,36 @@ func getConditionValues(r *http.Request, lc string, username string, claims map[
 	}
 
 	// JWT specific values
+	//
+	// Add all string claims
 	for k, v := range claims {
 		vStr, ok := v.(string)
 		if ok {
-			// Special case for AD/LDAP STS users
-			switch k {
-			case ldapUser:
-				args["user"] = []string{vStr}
-			case ldapUserN:
-				args["username"] = []string{vStr}
-			default:
-				args[k] = []string{vStr}
+			// Trim any LDAP specific prefix
+			args[strings.ToLower(strings.TrimPrefix(k, "ldap"))] = []string{vStr}
+		}
+	}
+
+	// Add groups claim which could be a list. This will ensure that the claim
+	// `jwt:groups` works.
+	if grpsVal, ok := claims["groups"]; ok {
+		if grpsIs, ok := grpsVal.([]interface{}); ok {
+			grps := []string{}
+			for _, gI := range grpsIs {
+				if g, ok := gI.(string); ok {
+					grps = append(grps, g)
+				}
 			}
+			if len(grps) > 0 {
+				args["groups"] = grps
+			}
+		}
+	}
+
+	// if not claim groups are available use the one with auth.Credentials
+	if _, ok := args["groups"]; !ok {
+		if len(groups) > 0 {
+			args["groups"] = groups
 		}
 	}
 
@@ -187,7 +248,7 @@ func getConditionValues(r *http.Request, lc string, username string, claims map[
 }
 
 // PolicyToBucketAccessPolicy converts a MinIO policy into a minio-go policy data structure.
-func PolicyToBucketAccessPolicy(bucketPolicy *policy.Policy) (*miniogopolicy.BucketAccessPolicy, error) {
+func PolicyToBucketAccessPolicy(bucketPolicy *policy.BucketPolicy) (*miniogopolicy.BucketAccessPolicy, error) {
 	// Return empty BucketAccessPolicy for empty bucket policy.
 	if bucketPolicy == nil {
 		return &miniogopolicy.BucketAccessPolicy{Version: policy.DefaultVersion}, nil
@@ -209,15 +270,15 @@ func PolicyToBucketAccessPolicy(bucketPolicy *policy.Policy) (*miniogopolicy.Buc
 	return &policyInfo, nil
 }
 
-// BucketAccessPolicyToPolicy - converts minio-go/policy.BucketAccessPolicy to policy.Policy.
-func BucketAccessPolicyToPolicy(policyInfo *miniogopolicy.BucketAccessPolicy) (*policy.Policy, error) {
+// BucketAccessPolicyToPolicy - converts minio-go/policy.BucketAccessPolicy to policy.BucketPolicy.
+func BucketAccessPolicyToPolicy(policyInfo *miniogopolicy.BucketAccessPolicy) (*policy.BucketPolicy, error) {
 	data, err := json.Marshal(policyInfo)
 	if err != nil {
 		// This should not happen because policyInfo is valid to convert to JSON data.
 		return nil, err
 	}
 
-	var bucketPolicy policy.Policy
+	var bucketPolicy policy.BucketPolicy
 	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	if err = json.Unmarshal(data, &bucketPolicy); err != nil {
 		// This should not happen because data is valid to JSON data.

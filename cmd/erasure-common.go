@@ -19,22 +19,25 @@ package cmd
 
 import (
 	"context"
+	"math/rand"
 	"sync"
+	"time"
 )
 
 func (er erasureObjects) getOnlineDisks() (newDisks []StorageAPI) {
 	disks := er.getDisks()
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	for _, i := range hashOrder(UTCNow().String(), len(disks)) {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for _, i := range r.Perm(len(disks)) {
 		i := i
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if disks[i-1] == nil {
+			if disks[i] == nil {
 				return
 			}
-			di, err := disks[i-1].DiskInfo(context.Background())
+			di, err := disks[i].DiskInfo(context.Background(), DiskInfoOptions{})
 			if err != nil || di.Healing {
 				// - Do not consume disks which are not reachable
 				//   unformatted or simply not accessible for some reason.
@@ -46,7 +49,7 @@ func (er erasureObjects) getOnlineDisks() (newDisks []StorageAPI) {
 			}
 
 			mu.Lock()
-			newDisks = append(newDisks, disks[i-1])
+			newDisks = append(newDisks, disks[i])
 			mu.Unlock()
 		}()
 	}
@@ -54,70 +57,29 @@ func (er erasureObjects) getOnlineDisks() (newDisks []StorageAPI) {
 	return newDisks
 }
 
-func (er erasureObjects) getLoadBalancedLocalDisks() (newDisks []StorageAPI) {
-	disks := er.getDisks()
+func (er erasureObjects) getOnlineLocalDisks() (newDisks []StorageAPI) {
+	disks := er.getOnlineDisks()
+
 	// Based on the random shuffling return back randomized disks.
-	for _, i := range hashOrder(UTCNow().String(), len(disks)) {
-		if disks[i-1] != nil && disks[i-1].IsLocal() {
-			if disks[i-1].Healing() == nil && disks[i-1].IsOnline() {
-				newDisks = append(newDisks, disks[i-1])
-			}
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	for _, i := range r.Perm(len(disks)) {
+		if disks[i] != nil && disks[i].IsLocal() {
+			newDisks = append(newDisks, disks[i])
 		}
 	}
+
 	return newDisks
 }
 
-// getLoadBalancedDisks - fetches load balanced (sufficiently randomized) disk slice.
-// ensures to skip disks if they are not healing and online.
-func (er erasureObjects) getLoadBalancedDisks(optimized bool) []StorageAPI {
+func (er erasureObjects) getLocalDisks() (newDisks []StorageAPI) {
 	disks := er.getDisks()
-
-	if !optimized {
-		var newDisks []StorageAPI
-		for _, i := range hashOrder(UTCNow().String(), len(disks)) {
-			newDisks = append(newDisks, disks[i-1])
-		}
-		return newDisks
-	}
-
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	newDisks := map[uint64][]StorageAPI{}
 	// Based on the random shuffling return back randomized disks.
-	for _, i := range hashOrder(UTCNow().String(), len(disks)) {
-		i := i
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if disks[i-1] == nil {
-				return
-			}
-			di, err := disks[i-1].DiskInfo(context.Background())
-			if err != nil || di.Healing {
-				// - Do not consume disks which are not reachable
-				//   unformatted or simply not accessible for some reason.
-				//
-				// - Do not consume disks which are being healed
-				//
-				// - Future: skip busy disks
-				return
-			}
-
-			mu.Lock()
-			// Capture disks usage wise upto resolution of MiB
-			newDisks[di.Used/1024/1024] = append(newDisks[di.Used/1024/1024], disks[i-1])
-			mu.Unlock()
-		}()
-	}
-	wg.Wait()
-
-	var max uint64
-	for k := range newDisks {
-		if k > max {
-			max = k
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for _, i := range r.Perm(len(disks)) {
+		if disks[i] != nil && disks[i].IsLocal() {
+			newDisks = append(newDisks, disks[i])
 		}
 	}
-
-	// Return disks which have maximum disk usage common.
-	return newDisks[max]
+	return newDisks
 }

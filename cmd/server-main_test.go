@@ -23,23 +23,75 @@ import (
 	"testing"
 )
 
+func TestServerConfigFile(t *testing.T) {
+	for _, testcase := range []struct {
+		config      string
+		expectedErr bool
+		hash        string
+	}{
+		{
+			config:      "testdata/config/1.yaml",
+			expectedErr: false,
+			hash:        "hash:02bf70285dc71f76",
+		},
+		{
+			config:      "testdata/config/2.yaml",
+			expectedErr: false,
+			hash:        "hash:676d2da00f71f205",
+		},
+		{
+			config:      "testdata/config/invalid.yaml",
+			expectedErr: true,
+		},
+		{
+			config:      "testdata/config/invalid-types.yaml",
+			expectedErr: true,
+		},
+		{
+			config:      "testdata/config/invalid-disks.yaml",
+			expectedErr: true,
+		},
+	} {
+		testcase := testcase
+		t.Run(testcase.config, func(t *testing.T) {
+			sctx := &serverCtxt{}
+			err := mergeServerCtxtFromConfigFile(testcase.config, sctx)
+			if testcase.expectedErr && err == nil {
+				t.Error("expected failure, got success")
+			}
+			if !testcase.expectedErr && err != nil {
+				t.Error("expected success, got failure", err)
+			}
+			if err == nil {
+				if len(sctx.Layout.pools) != 2 {
+					t.Error("expected parsed pools to be 2, not", len(sctx.Layout.pools))
+				}
+				if sctx.Layout.pools[0].cmdline != testcase.hash {
+					t.Error("expected hash", testcase.hash, "got", sctx.Layout.pools[0].cmdline)
+				}
+			}
+		})
+	}
+}
+
 // Tests initializing new object layer.
 func TestNewObjectLayer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// Tests for FS object layer.
+	// Tests for ErasureSD object layer.
 	nDisks := 1
 	disks, err := getRandomDisks(nDisks)
 	if err != nil {
-		t.Fatal("Failed to create disks for the backend")
+		t.Fatal("Failed to create drives for the backend")
 	}
 	defer removeRoots(disks)
 
-	obj, err := newObjectLayer(ctx, mustGetPoolEndpoints(disks...))
+	obj, err := newObjectLayer(ctx, mustGetPoolEndpoints(0, disks...))
 	if err != nil {
 		t.Fatal("Unexpected object layer initialization error", err)
 	}
-	_, ok := obj.(*FSObjects)
+
+	_, ok := obj.(*erasureServerPools)
 	if !ok {
 		t.Fatal("Unexpected object layer detected", reflect.TypeOf(obj))
 	}
@@ -50,11 +102,11 @@ func TestNewObjectLayer(t *testing.T) {
 	nDisks = 16
 	disks, err = getRandomDisks(nDisks)
 	if err != nil {
-		t.Fatal("Failed to create disks for the backend")
+		t.Fatal("Failed to create drives for the backend")
 	}
 	defer removeRoots(disks)
 
-	obj, err = newObjectLayer(ctx, mustGetPoolEndpoints(disks...))
+	obj, err = newObjectLayer(ctx, mustGetPoolEndpoints(0, disks...))
 	if err != nil {
 		t.Fatal("Unexpected object layer initialization error", err)
 	}

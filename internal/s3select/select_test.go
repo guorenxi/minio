@@ -22,7 +22,6 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"reflect"
@@ -33,6 +32,22 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/simdjson-go"
 )
+
+func newStringRSC(s string) io.ReadSeekCloser {
+	return newBytesRSC([]byte(s))
+}
+
+func newBytesRSC(b []byte) io.ReadSeekCloser {
+	r := bytes.NewReader(b)
+	segmentReader := func(offset int64) (io.ReadCloser, error) {
+		_, err := r.Seek(offset, io.SeekStart)
+		if err != nil {
+			return nil, err
+		}
+		return io.NopCloser(r), nil
+	}
+	return NewObjectReadSeekCloser(segmentReader, int64(len(b)))
+}
 
 type testResponseWriter struct {
 	statusCode int
@@ -93,6 +108,21 @@ func TestJSONQueries(t *testing.T) {
 			name:       "donatello-2",
 			query:      `SELECT * from s3object s WHERE 'bar' in s.synonyms[*]`,
 			wantResult: `{"id":0,"title":"Test Record","desc":"Some text","synonyms":["foo","bar","whatever"]}`,
+		},
+		{
+			name:       "in-expression-precedence-1",
+			query:      "select * from s3object s where 'bar' in s.synonyms and s.id = 0",
+			wantResult: `{"id":0,"title":"Test Record","desc":"Some text","synonyms":["foo","bar","whatever"]}`,
+		},
+		{
+			name:       "in-expression-precedence-2",
+			query:      "select * from s3object s where 'some' in ('somex', s.synonyms[0]) and s.id = 1",
+			wantResult: `{"id":1,"title":"Second Record","desc":"another text","synonyms":["some","synonym","value"]}`,
+		},
+		{
+			name:       "in-expression-with-aggregation",
+			query:      "select SUM(s.id) from s3object s Where 2 in s.numbers[*] or 'some' in s.synonyms[*]",
+			wantResult: `{"_1":3}`,
 		},
 		{
 			name:  "bignum-1",
@@ -474,6 +504,96 @@ func TestJSONQueries(t *testing.T) {
 			wantResult: `{"Id":1,"Name":"Anshu","Address":"Templestowe","Car":"Jeep"}`,
 			withJSON:   `{ "person": [ { "Id": 1, "Name": "Anshu", "Address": "Templestowe", "Car": "Jeep" }, { "Id": 2, "Name": "Ben Mostafa", "Address": "Las Vegas", "Car": "Mustang" }, { "Id": 3, "Name": "Rohan Wood", "Address": "Wooddon", "Car": "VW" } ] }`,
 		},
+		{
+			name:       "lower-case-is",
+			query:      `select * from s3object[*] as s where s.request.header['User-Agent'] is not null`,
+			wantResult: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}`,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+		},
+		{
+			name:       "is-not-missing",
+			query:      `select * from s3object[*] as s where s.request.header['User-Agent'] is not missing`,
+			wantResult: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}`,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+		},
+		{
+			name:  "is-not-missing-2",
+			query: `select * from s3object[*] as s where s.request.header is not missing`,
+			wantResult: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+		},
+		{
+			name:  "is-not-missing-null",
+			query: `select * from s3object[*] as s where s.request.header is not missing`,
+			wantResult: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":null}}`,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":null}}`,
+		},
+		{
+			name:       "is-not-missing",
+			query:      `select * from s3object[*] as s where s.request.header['User-Agent'] is not missing`,
+			wantResult: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}`,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+		},
+		{
+			name:  "is-not-missing-2",
+			query: `select * from s3object[*] as s where s.request.header is not missing`,
+			wantResult: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+		},
+		{
+			name:  "is-not-missing-null",
+			query: `select * from s3object[*] as s where s.request.header is not missing`,
+			wantResult: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":null}}`,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":null}}`,
+		},
+
+		{
+			name:       "is-missing",
+			query:      `select * from s3object[*] as s where s.request.header['User-Agent'] is missing`,
+			wantResult: `{"request":{"uri":"/2","header":{}}}`,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+		},
+		{
+			name:       "is-missing-2",
+			query:      `select * from s3object[*] as s where s.request.header is missing`,
+			wantResult: ``,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+		},
+		{
+			name:       "is-missing",
+			query:      `select * from s3object[*] as s where s.request.header['User-Agent'] = missing`,
+			wantResult: `{"request":{"uri":"/2","header":{}}}`,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+		},
+		{
+			name:       "is-missing-null",
+			query:      `select * from s3object[*] as s where s.request.header is missing`,
+			wantResult: ``,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":null}}`,
+		},
+		{
+			name:  "is-missing-select",
+			query: `select s.request.header['User-Agent'] as h from s3object[*] as s`,
+			wantResult: `{"h":"test"}
+{}`,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+		},
 	}
 
 	defRequest := `<?xml version="1.0" encoding="UTF-8"?>
@@ -517,13 +637,11 @@ func TestJSONQueries(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if err = s3Select.Open(func(offset, length int64) (io.ReadCloser, error) {
-				in := input
-				if len(testCase.withJSON) > 0 {
-					in = testCase.withJSON
-				}
-				return ioutil.NopCloser(bytes.NewBufferString(in)), nil
-			}); err != nil {
+			in := input
+			if len(testCase.withJSON) > 0 {
+				in = testCase.withJSON
+			}
+			if err = s3Select.Open(newStringRSC(in)); err != nil {
 				t.Fatal(err)
 			}
 
@@ -532,7 +650,7 @@ func TestJSONQueries(t *testing.T) {
 			s3Select.Close()
 			resp := http.Response{
 				StatusCode:    http.StatusOK,
-				Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+				Body:          io.NopCloser(bytes.NewReader(w.response)),
 				ContentLength: int64(len(w.response)),
 			}
 			res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -540,7 +658,7 @@ func TestJSONQueries(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			got, err := ioutil.ReadAll(res)
+			got, err := io.ReadAll(res)
 			if err != nil {
 				t.Error(err)
 				return
@@ -565,13 +683,11 @@ func TestJSONQueries(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if err = s3Select.Open(func(offset, length int64) (io.ReadCloser, error) {
-				in := input
-				if len(testCase.withJSON) > 0 {
-					in = testCase.withJSON
-				}
-				return ioutil.NopCloser(bytes.NewBufferString(in)), nil
-			}); err != nil {
+			in := input
+			if len(testCase.withJSON) > 0 {
+				in = testCase.withJSON
+			}
+			if err = s3Select.Open(newStringRSC(in)); err != nil {
 				t.Fatal(err)
 			}
 
@@ -580,7 +696,7 @@ func TestJSONQueries(t *testing.T) {
 			s3Select.Close()
 			resp := http.Response{
 				StatusCode:    http.StatusOK,
-				Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+				Body:          io.NopCloser(bytes.NewReader(w.response)),
 				ContentLength: int64(len(w.response)),
 			}
 			res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -588,7 +704,7 @@ func TestJSONQueries(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			got, err := ioutil.ReadAll(res)
+			got, err := io.ReadAll(res)
 			if err != nil {
 				t.Error(err)
 				return
@@ -652,9 +768,7 @@ func TestCSVQueries(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if err = s3Select.Open(func(offset, length int64) (io.ReadCloser, error) {
-				return ioutil.NopCloser(bytes.NewBufferString(input)), nil
-			}); err != nil {
+			if err = s3Select.Open(newStringRSC(input)); err != nil {
 				t.Fatal(err)
 			}
 
@@ -663,7 +777,7 @@ func TestCSVQueries(t *testing.T) {
 			s3Select.Close()
 			resp := http.Response{
 				StatusCode:    http.StatusOK,
-				Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+				Body:          io.NopCloser(bytes.NewReader(w.response)),
 				ContentLength: int64(len(w.response)),
 			}
 			res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -671,7 +785,7 @@ func TestCSVQueries(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			got, err := ioutil.ReadAll(res)
+			got, err := io.ReadAll(res)
 			if err != nil {
 				t.Error(err)
 				return
@@ -837,9 +951,7 @@ func TestCSVQueries2(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if err = s3Select.Open(func(offset, length int64) (io.ReadCloser, error) {
-				return ioutil.NopCloser(bytes.NewBuffer(testCase.input)), nil
-			}); err != nil {
+			if err = s3Select.Open(newBytesRSC(testCase.input)); err != nil {
 				t.Fatal(err)
 			}
 
@@ -848,7 +960,7 @@ func TestCSVQueries2(t *testing.T) {
 			s3Select.Close()
 			resp := http.Response{
 				StatusCode:    http.StatusOK,
-				Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+				Body:          io.NopCloser(bytes.NewReader(w.response)),
 				ContentLength: int64(len(w.response)),
 			}
 			res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -856,7 +968,7 @@ func TestCSVQueries2(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			got, err := ioutil.ReadAll(res)
+			got, err := io.ReadAll(res)
 			if err != nil {
 				t.Error(err)
 				return
@@ -983,9 +1095,7 @@ true`,
 				t.Fatal(err)
 			}
 
-			if err = s3Select.Open(func(offset, length int64) (io.ReadCloser, error) {
-				return ioutil.NopCloser(bytes.NewBufferString(input)), nil
-			}); err != nil {
+			if err = s3Select.Open(newStringRSC(input)); err != nil {
 				t.Fatal(err)
 			}
 
@@ -994,7 +1104,7 @@ true`,
 			s3Select.Close()
 			resp := http.Response{
 				StatusCode:    http.StatusOK,
-				Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+				Body:          io.NopCloser(bytes.NewReader(w.response)),
 				ContentLength: int64(len(w.response)),
 			}
 			res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -1002,7 +1112,7 @@ true`,
 				t.Error(err)
 				return
 			}
-			got, err := ioutil.ReadAll(res)
+			got, err := io.ReadAll(res)
 			if err != nil {
 				t.Error(err)
 				return
@@ -1129,9 +1239,7 @@ func TestCSVInput(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if err = s3Select.Open(func(offset, length int64) (io.ReadCloser, error) {
-				return ioutil.NopCloser(bytes.NewReader(csvData)), nil
-			}); err != nil {
+			if err = s3Select.Open(newBytesRSC(csvData)); err != nil {
 				t.Fatal(err)
 			}
 
@@ -1142,7 +1250,7 @@ func TestCSVInput(t *testing.T) {
 			if !reflect.DeepEqual(w.response, testCase.expectedResult) {
 				resp := http.Response{
 					StatusCode:    http.StatusOK,
-					Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+					Body:          io.NopCloser(bytes.NewReader(w.response)),
 					ContentLength: int64(len(w.response)),
 				}
 				res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -1150,7 +1258,7 @@ func TestCSVInput(t *testing.T) {
 					t.Error(err)
 					return
 				}
-				got, err := ioutil.ReadAll(res)
+				got, err := io.ReadAll(res)
 				if err != nil {
 					t.Error(err)
 					return
@@ -1251,9 +1359,7 @@ func TestJSONInput(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if err = s3Select.Open(func(offset, length int64) (io.ReadCloser, error) {
-				return ioutil.NopCloser(bytes.NewReader(jsonData)), nil
-			}); err != nil {
+			if err = s3Select.Open(newBytesRSC(jsonData)); err != nil {
 				t.Fatal(err)
 			}
 
@@ -1264,7 +1370,7 @@ func TestJSONInput(t *testing.T) {
 			if !reflect.DeepEqual(w.response, testCase.expectedResult) {
 				resp := http.Response{
 					StatusCode:    http.StatusOK,
-					Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+					Body:          io.NopCloser(bytes.NewReader(w.response)),
 					ContentLength: int64(len(w.response)),
 				}
 				res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -1272,7 +1378,7 @@ func TestJSONInput(t *testing.T) {
 					t.Error(err)
 					return
 				}
-				got, err := ioutil.ReadAll(res)
+				got, err := io.ReadAll(res)
 				if err != nil {
 					t.Error(err)
 					return
@@ -1284,9 +1390,320 @@ func TestJSONInput(t *testing.T) {
 	}
 }
 
+func TestCSVRanges(t *testing.T) {
+	testInput := []byte(`id,time,num,num2,text
+1,2010-01-01T,7867786,4565.908123,"a text, with comma"
+2,2017-01-02T03:04Z,-5, 0.765111,
+`)
+	testTable := []struct {
+		name       string
+		query      string
+		input      []byte
+		requestXML []byte // override request XML
+		wantResult string
+		wantErr    bool
+	}{
+		{
+			name:  "select-all",
+			input: testInput,
+			query: ``,
+			// Since we are doing offset, no headers are used.
+			wantResult: `{"_1":"2","_2":"2017-01-02T03:04Z","_3":"-5","_4":" 0.765111","_5":""}`,
+			requestXML: []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<SelectObjectContentRequest>
+    <Expression>SELECT * from s3object AS s</Expression>
+    <ExpressionType>SQL</ExpressionType>
+    <InputSerialization>
+        <CompressionType>NONE</CompressionType>
+        <CSV>
+        <FileHeaderInfo>NONE</FileHeaderInfo>
+	    <QuoteCharacter>"</QuoteCharacter>
+        </CSV>
+    </InputSerialization>
+    <OutputSerialization>
+        <JSON>
+        </JSON>
+    </OutputSerialization>
+    <RequestProgress>
+        <Enabled>FALSE</Enabled>
+    </RequestProgress>
+	<ScanRange><Start>76</Start><End>109</End></ScanRange>
+</SelectObjectContentRequest>`),
+		},
+		{
+			name:  "select-remain",
+			input: testInput,
+			// Since we are doing offset, no headers are used.
+			wantResult: `{"_1":"2","_2":"2017-01-02T03:04Z","_3":"-5","_4":" 0.765111","_5":""}`,
+			requestXML: []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<SelectObjectContentRequest>
+    <Expression>SELECT * from s3object AS s</Expression>
+    <ExpressionType>SQL</ExpressionType>
+    <InputSerialization>
+        <CompressionType>NONE</CompressionType>
+        <CSV>
+        <FileHeaderInfo>NONE</FileHeaderInfo>
+	    <QuoteCharacter>"</QuoteCharacter>
+        </CSV>
+    </InputSerialization>
+    <OutputSerialization>
+        <JSON>
+        </JSON>
+    </OutputSerialization>
+    <RequestProgress>
+        <Enabled>FALSE</Enabled>
+    </RequestProgress>
+	<ScanRange><Start>76</Start></ScanRange>
+</SelectObjectContentRequest>`),
+		},
+		{
+			name:  "select-end-bytes",
+			input: testInput,
+			query: ``,
+			// Since we are doing offset, no headers are used.
+			wantResult: `{"_1":"2","_2":"2017-01-02T03:04Z","_3":"-5","_4":" 0.765111","_5":""}`,
+			requestXML: []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<SelectObjectContentRequest>
+    <Expression>SELECT * from s3object AS s</Expression>
+    <ExpressionType>SQL</ExpressionType>
+    <InputSerialization>
+        <CompressionType>NONE</CompressionType>
+        <CSV>
+        <FileHeaderInfo>NONE</FileHeaderInfo>
+	    <QuoteCharacter>"</QuoteCharacter>
+        </CSV>
+    </InputSerialization>
+    <OutputSerialization>
+        <JSON>
+        </JSON>
+    </OutputSerialization>
+    <RequestProgress>
+        <Enabled>FALSE</Enabled>
+    </RequestProgress>
+	<ScanRange><End>35</End></ScanRange>
+</SelectObjectContentRequest>`),
+		},
+		{
+			name:  "select-middle",
+			input: testInput,
+			// Since we are doing offset, no headers are used.
+			wantResult: `{"_1":"a text, with comma"}`,
+			requestXML: []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<SelectObjectContentRequest>
+    <Expression>SELECT * from s3object AS s</Expression>
+    <ExpressionType>SQL</ExpressionType>
+    <InputSerialization>
+        <CompressionType>NONE</CompressionType>
+        <CSV>
+        <FileHeaderInfo>NONE</FileHeaderInfo>
+	    <QuoteCharacter>"</QuoteCharacter>
+        </CSV>
+    </InputSerialization>
+    <OutputSerialization>
+        <JSON>
+        </JSON>
+    </OutputSerialization>
+    <RequestProgress>
+        <Enabled>FALSE</Enabled>
+    </RequestProgress>
+	<ScanRange><Start>56</Start><End>76</End></ScanRange>
+</SelectObjectContentRequest>`),
+		},
+		{
+			name:  "error-end-before-start",
+			input: testInput,
+			// Since we are doing offset, no headers are used.
+			wantResult: ``,
+			wantErr:    true,
+			requestXML: []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<SelectObjectContentRequest>
+    <Expression>SELECT * from s3object AS s</Expression>
+    <ExpressionType>SQL</ExpressionType>
+    <InputSerialization>
+        <CompressionType>NONE</CompressionType>
+        <CSV>
+        <FileHeaderInfo>NONE</FileHeaderInfo>
+	    <QuoteCharacter>"</QuoteCharacter>
+        </CSV>
+    </InputSerialization>
+    <OutputSerialization>
+        <JSON>
+        </JSON>
+    </OutputSerialization>
+    <RequestProgress>
+        <Enabled>FALSE</Enabled>
+    </RequestProgress>
+	<ScanRange><Start>56</Start><End>26</End></ScanRange>
+</SelectObjectContentRequest>`),
+		},
+		{
+			name:  "error-empty",
+			input: testInput,
+			// Since we are doing offset, no headers are used.
+			wantResult: ``,
+			wantErr:    true,
+			requestXML: []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<SelectObjectContentRequest>
+    <Expression>SELECT * from s3object AS s</Expression>
+    <ExpressionType>SQL</ExpressionType>
+    <InputSerialization>
+        <CompressionType>NONE</CompressionType>
+        <CSV>
+        <FileHeaderInfo>NONE</FileHeaderInfo>
+	    <QuoteCharacter>"</QuoteCharacter>
+        </CSV>
+    </InputSerialization>
+    <OutputSerialization>
+        <JSON>
+        </JSON>
+    </OutputSerialization>
+    <RequestProgress>
+        <Enabled>FALSE</Enabled>
+    </RequestProgress>
+	<ScanRange></ScanRange>
+</SelectObjectContentRequest>`),
+		},
+		{
+			name: "var-field-count",
+			input: []byte(`id,time,num,num2,text
+1,2010-01-01T,7867786,4565.908123
+2,2017-01-02T03:04Z,-5, 0.765111,Some some
+`),
+			// Since we are doing offset, no headers are used.
+			wantResult: `{"id":"1","time":"2010-01-01T","num":"7867786","num2":"4565.908123"}
+{"id":"2","time":"2017-01-02T03:04Z","num":"-5","num2":" 0.765111","text":"Some some"}`,
+			wantErr: false,
+			requestXML: []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<SelectObjectContentRequest>
+    <Expression>SELECT * from s3object</Expression>
+    <ExpressionType>SQL</ExpressionType>
+    <InputSerialization>
+        <CompressionType>NONE</CompressionType>
+        <CSV>
+        <FileHeaderInfo>USE</FileHeaderInfo>
+	    <QuoteCharacter>"</QuoteCharacter>
+        </CSV>
+    </InputSerialization>
+    <OutputSerialization>
+        <JSON>
+        </JSON>
+    </OutputSerialization>
+    <RequestProgress>
+        <Enabled>FALSE</Enabled>
+    </RequestProgress>
+</SelectObjectContentRequest>`),
+		},
+		{
+			name:  "error-after-eof",
+			input: testInput,
+			// Since we are doing offset, no headers are used.
+			wantResult: ``,
+			wantErr:    true,
+			requestXML: []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<SelectObjectContentRequest>
+    <Expression>SELECT * from s3object AS s</Expression>
+    <ExpressionType>SQL</ExpressionType>
+    <InputSerialization>
+        <CompressionType>NONE</CompressionType>
+        <CSV>
+        <FileHeaderInfo>NONE</FileHeaderInfo>
+	    <QuoteCharacter>"</QuoteCharacter>
+        </CSV>
+    </InputSerialization>
+    <OutputSerialization>
+        <JSON>
+        </JSON>
+    </OutputSerialization>
+    <RequestProgress>
+        <Enabled>FALSE</Enabled>
+    </RequestProgress>
+	<ScanRange><Start>2600000</Start></ScanRange>
+</SelectObjectContentRequest>`),
+		},
+		{
+			name:  "error-after-eof",
+			input: testInput,
+			// Since we are doing offset, no headers are used.
+			wantResult: ``,
+			wantErr:    true,
+			requestXML: []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<SelectObjectContentRequest>
+    <Expression>SELECT * from s3object AS s</Expression>
+    <ExpressionType>SQL</ExpressionType>
+    <InputSerialization>
+        <CompressionType>NONE</CompressionType>
+        <CSV>
+        <FileHeaderInfo>NONE</FileHeaderInfo>
+	    <QuoteCharacter>"</QuoteCharacter>
+        </CSV>
+    </InputSerialization>
+    <OutputSerialization>
+        <JSON>
+        </JSON>
+    </OutputSerialization>
+    <RequestProgress>
+        <Enabled>FALSE</Enabled>
+    </RequestProgress>
+	<ScanRange><Start>2600000</Start><End>2600001</End></ScanRange>
+</SelectObjectContentRequest>`),
+		},
+	}
+
+	for _, testCase := range testTable {
+		t.Run(testCase.name, func(t *testing.T) {
+			testReq := testCase.requestXML
+			s3Select, err := NewS3Select(bytes.NewReader(testReq))
+			if err != nil {
+				if !testCase.wantErr {
+					t.Fatal(err)
+				}
+				t.Logf("got expected error: %v", err)
+				return
+			}
+
+			if err = s3Select.Open(newBytesRSC(testCase.input)); err != nil {
+				if !testCase.wantErr {
+					t.Fatal(err)
+				}
+				t.Logf("got expected error: %v", err)
+				return
+			} else if testCase.wantErr {
+				t.Error("did not get expected error")
+				return
+			}
+
+			w := &testResponseWriter{}
+			s3Select.Evaluate(w)
+			s3Select.Close()
+			resp := http.Response{
+				StatusCode:    http.StatusOK,
+				Body:          io.NopCloser(bytes.NewReader(w.response)),
+				ContentLength: int64(len(w.response)),
+			}
+			res, err := minio.NewSelectResults(&resp, "testbucket")
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			got, err := io.ReadAll(res)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			gotS := strings.TrimSpace(string(got))
+			if !reflect.DeepEqual(gotS, testCase.wantResult) {
+				t.Errorf("received response does not match with expected reply. Query: %s\ngot: %s\nwant:%s", testCase.query, gotS, testCase.wantResult)
+			}
+		})
+	}
+}
+
 func TestParquetInput(t *testing.T) {
-	os.Setenv("MINIO_API_SELECT_PARQUET", "on")
-	defer os.Setenv("MINIO_API_SELECT_PARQUET", "off")
+	saved := parquetSupport
+	defer func() {
+		parquetSupport = saved
+	}()
+	parquetSupport = true
 
 	testTable := []struct {
 		requestXML     []byte
@@ -1342,27 +1759,10 @@ func TestParquetInput(t *testing.T) {
 
 	for i, testCase := range testTable {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
-			getReader := func(offset int64, length int64) (io.ReadCloser, error) {
-				testdataFile := "testdata/testdata.parquet"
-				file, err := os.Open(testdataFile)
-				if err != nil {
-					return nil, err
-				}
-
-				fi, err := file.Stat()
-				if err != nil {
-					return nil, err
-				}
-
-				if offset < 0 {
-					offset = fi.Size() + offset
-				}
-
-				if _, err = file.Seek(offset, io.SeekStart); err != nil {
-					return nil, err
-				}
-
-				return file, nil
+			testdataFile := "testdata/testdata.parquet"
+			file, err := os.Open(testdataFile)
+			if err != nil {
+				t.Fatal(err)
 			}
 
 			s3Select, err := NewS3Select(bytes.NewReader(testCase.requestXML))
@@ -1370,9 +1770,11 @@ func TestParquetInput(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if err = s3Select.Open(getReader); err != nil {
+			if err = s3Select.Open(file); err != nil {
 				t.Fatal(err)
 			}
+
+			fmt.Printf("R: \nE: %s\n" /* string(w.response), */, string(testCase.expectedResult))
 
 			w := &testResponseWriter{}
 			s3Select.Evaluate(w)
@@ -1381,7 +1783,7 @@ func TestParquetInput(t *testing.T) {
 			if !reflect.DeepEqual(w.response, testCase.expectedResult) {
 				resp := http.Response{
 					StatusCode:    http.StatusOK,
-					Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+					Body:          io.NopCloser(bytes.NewReader(w.response)),
 					ContentLength: int64(len(w.response)),
 				}
 				res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -1389,7 +1791,7 @@ func TestParquetInput(t *testing.T) {
 					t.Error(err)
 					return
 				}
-				got, err := ioutil.ReadAll(res)
+				got, err := io.ReadAll(res)
 				if err != nil {
 					t.Error(err)
 					return
@@ -1402,8 +1804,11 @@ func TestParquetInput(t *testing.T) {
 }
 
 func TestParquetInputSchema(t *testing.T) {
-	os.Setenv("MINIO_API_SELECT_PARQUET", "on")
-	defer os.Setenv("MINIO_API_SELECT_PARQUET", "off")
+	saved := parquetSupport
+	defer func() {
+		parquetSupport = saved
+	}()
+	parquetSupport = true
 
 	testTable := []struct {
 		requestXML []byte
@@ -1463,27 +1868,10 @@ func TestParquetInputSchema(t *testing.T) {
 
 	for i, testCase := range testTable {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
-			getReader := func(offset int64, length int64) (io.ReadCloser, error) {
-				testdataFile := "testdata/lineitem_shipdate.parquet"
-				file, err := os.Open(testdataFile)
-				if err != nil {
-					return nil, err
-				}
-
-				fi, err := file.Stat()
-				if err != nil {
-					return nil, err
-				}
-
-				if offset < 0 {
-					offset = fi.Size() + offset
-				}
-
-				if _, err = file.Seek(offset, io.SeekStart); err != nil {
-					return nil, err
-				}
-
-				return file, nil
+			testdataFile := "testdata/lineitem_shipdate.parquet"
+			file, err := os.Open(testdataFile)
+			if err != nil {
+				t.Fatal(err)
 			}
 
 			s3Select, err := NewS3Select(bytes.NewReader(testCase.requestXML))
@@ -1491,7 +1879,7 @@ func TestParquetInputSchema(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if err = s3Select.Open(getReader); err != nil {
+			if err = s3Select.Open(file); err != nil {
 				t.Fatal(err)
 			}
 
@@ -1500,7 +1888,7 @@ func TestParquetInputSchema(t *testing.T) {
 			s3Select.Close()
 			resp := http.Response{
 				StatusCode:    http.StatusOK,
-				Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+				Body:          io.NopCloser(bytes.NewReader(w.response)),
 				ContentLength: int64(len(w.response)),
 			}
 			res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -1508,7 +1896,7 @@ func TestParquetInputSchema(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			got, err := ioutil.ReadAll(res)
+			got, err := io.ReadAll(res)
 			if err != nil {
 				t.Error(err)
 				return
@@ -1522,8 +1910,11 @@ func TestParquetInputSchema(t *testing.T) {
 }
 
 func TestParquetInputSchemaCSV(t *testing.T) {
-	os.Setenv("MINIO_API_SELECT_PARQUET", "on")
-	defer os.Setenv("MINIO_API_SELECT_PARQUET", "off")
+	saved := parquetSupport
+	defer func() {
+		parquetSupport = saved
+	}()
+	parquetSupport = true
 
 	testTable := []struct {
 		requestXML []byte
@@ -1581,27 +1972,10 @@ func TestParquetInputSchemaCSV(t *testing.T) {
 
 	for i, testCase := range testTable {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
-			getReader := func(offset int64, length int64) (io.ReadCloser, error) {
-				testdataFile := "testdata/lineitem_shipdate.parquet"
-				file, err := os.Open(testdataFile)
-				if err != nil {
-					return nil, err
-				}
-
-				fi, err := file.Stat()
-				if err != nil {
-					return nil, err
-				}
-
-				if offset < 0 {
-					offset = fi.Size() + offset
-				}
-
-				if _, err = file.Seek(offset, io.SeekStart); err != nil {
-					return nil, err
-				}
-
-				return file, nil
+			testdataFile := "testdata/lineitem_shipdate.parquet"
+			file, err := os.Open(testdataFile)
+			if err != nil {
+				t.Fatal(err)
 			}
 
 			s3Select, err := NewS3Select(bytes.NewReader(testCase.requestXML))
@@ -1609,7 +1983,7 @@ func TestParquetInputSchemaCSV(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if err = s3Select.Open(getReader); err != nil {
+			if err = s3Select.Open(file); err != nil {
 				t.Fatal(err)
 			}
 
@@ -1618,7 +1992,7 @@ func TestParquetInputSchemaCSV(t *testing.T) {
 			s3Select.Close()
 			resp := http.Response{
 				StatusCode:    http.StatusOK,
-				Body:          ioutil.NopCloser(bytes.NewReader(w.response)),
+				Body:          io.NopCloser(bytes.NewReader(w.response)),
 				ContentLength: int64(len(w.response)),
 			}
 			res, err := minio.NewSelectResults(&resp, "testbucket")
@@ -1626,7 +2000,7 @@ func TestParquetInputSchemaCSV(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			got, err := ioutil.ReadAll(res)
+			got, err := io.ReadAll(res)
 			if err != nil {
 				t.Error(err)
 				return

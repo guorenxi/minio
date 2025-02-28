@@ -1,26 +1,15 @@
-# How to monitor MinIO server with Prometheus [![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io)
+# How to monitor MinIO server with Prometheus? [![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io)
 
-[Prometheus](https://prometheus.io) is a cloud-native monitoring platform.
+[Prometheus](https://prometheus.io) is a cloud-native monitoring platform. Prometheus offers a multi-dimensional data model with time series data identified by metric name and key/value pairs. The data collection happens via a pull model over HTTP/HTTPS. Users looking to monitor their MinIO instances can point Prometheus configuration to scrape data from following endpoints. 
 
-Prometheus offers a multi-dimensional data model with time series data identified by metric name and key/value pairs. The data collection happens via a pull model over HTTP/HTTPS.
+- MinIO exports Prometheus compatible data by default as an authorized endpoint at `/minio/v2/metrics/cluster`. 
+- MinIO exports Prometheus compatible data by default which is bucket centric as an authorized endpoint at `/minio/v2/metrics/bucket`.
 
-MinIO exports Prometheus compatible data by default as an authorized endpoint at `/minio/v2/metrics/cluster`. Users looking to monitor their MinIO instances can point Prometheus configuration to scrape data from this endpoint. This document explains how to setup Prometheus and configure it to scrape data from MinIO servers.
-
-**Table of Contents**
-
-- [Prerequisites](#prerequisites)
-    - [1. Download Prometheus](#1-download-prometheus)
-    - [2. Configure authentication type for Prometheus metrics](#2-configure-authentication-type-for-prometheus-metrics)
-    - [3. Configuring Prometheus](#3-configuring-prometheus)
-        - [3.1 Authenticated Prometheus config](#31-authenticated-prometheus-config)
-        - [3.2 Public Prometheus config](#32-public-prometheus-config)
-    - [4. Update `scrape_configs` section in prometheus.yml](#4-update-scrapeconfigs-section-in-prometheusyml)
-    - [5. Start Prometheus](#5-start-prometheus)
-    - [6. Configure Grafana](#6-configure-grafana)
-- [List of metrics exposed by MinIO](#list-of-metrics-exposed-by-minio)
+This document explains how to setup Prometheus and configure it to scrape data from MinIO servers.
 
 ## Prerequisites
-To get started with MinIO, refer [MinIO QuickStart Document](https://docs.min.io/docs/minio-quickstart-guide).
+
+To get started with MinIO, refer [MinIO QuickStart Document](https://min.io/docs/minio/linux/index.html#quickstart-for-linux).
 Follow below steps to get started with MinIO monitoring using Prometheus.
 
 ### 1. Download Prometheus
@@ -60,9 +49,11 @@ minio server ~/test
 
 > If MinIO is configured to expose metrics without authentication, you don't need to use `mc` to generate prometheus config. You can skip reading further and move to 3.2 section.
 
-The Prometheus endpoint in MinIO requires authentication by default. Prometheus supports a bearer token approach to authenticate prometheus scrape requests, override the default Prometheus config with the one generated using mc. To generate a Prometheus config for an alias, use [mc](https://docs.min.io/docs/minio-client-quickstart-guide) as follows `mc admin prometheus generate <alias>`.
+The Prometheus endpoint in MinIO requires authentication by default. Prometheus supports a bearer token approach to authenticate prometheus scrape requests, override the default Prometheus config with the one generated using mc. To generate a Prometheus config for an alias, use [mc](https://min.io/docs/minio/linux/reference/minio-mc.html#quickstart) as follows `mc admin prometheus generate <alias> [METRIC-TYPE]`. The valid values for METRIC-TYPE are `cluster`, `node`, `bucket` and `resource` and if not mentioned, it defaults to `cluster`.
 
 The command will generate the `scrape_configs` section of the prometheus.yml as follows:
+
+##### Cluster
 
 ```yaml
 scrape_configs:
@@ -74,12 +65,46 @@ scrape_configs:
   - targets: ['localhost:9000']
 ```
 
+##### Bucket centric
+
+```yaml
+- job_name: minio-job-bucket
+  bearer_token: <secret>
+  metrics_path: /minio/v2/metrics/bucket
+  scheme: http
+  static_configs:
+  - targets: ['localhost:9000']
+```
+
+##### Node centric (optional)
+
+```yaml
+- job_name: minio-job-node
+  bearer_token: <secret>
+  metrics_path: /minio/v2/metrics/node
+  scheme: http
+  static_configs:
+  - targets: ['localhost:9000']
+```
+
+##### Resource centric (optional)
+
+```yaml
+- job_name: minio-job-resource
+  bearer_token: <secret>
+  metrics_path: /minio/v2/metrics/resource
+  scheme: http
+  static_configs:
+  - targets: ['localhost:9000']
+```
+
 #### 3.2 Public Prometheus config
 
 If Prometheus endpoint authentication type is set to `public`. Following prometheus config is sufficient to start scraping metrics data from MinIO.
 This can be collected from any server once per collection.
 
 ##### Cluster
+
 ```yaml
 scrape_configs:
 - job_name: minio-job
@@ -89,12 +114,40 @@ scrape_configs:
   - targets: ['localhost:9000']
 ```
 
+#### Bucket centric
+
+```yaml
+scrape_configs:
+- job_name: minio-job-bucket
+  metrics_path: /minio/v2/metrics/bucket
+  scheme: http
+  static_configs:
+  - targets: ['localhost:9000']
+```
+
 ##### Node (optional)
+
 Optionally you can also collect per node metrics. This needs to be done on a per server instance.
+The scrape configurations should use all the servers under `targets` so that graphing systems like
+grafana can visualize them for all the nodes
+
 ```yaml
 scrape_configs:
 - job_name: minio-job
   metrics_path: /minio/v2/metrics/node
+  scheme: http
+  static_configs:
+  - targets: ['server1:9000','server2:9000','server3:9000','server4:9000']
+```
+
+##### Resource (optional)
+
+Optionally you can also collect resource metrics.
+
+```yaml
+scrape_configs:
+- job_name: minio-job
+  metrics_path: /minio/v2/metrics/resource
   scheme: http
   static_configs:
   - targets: ['localhost:9000']
@@ -118,17 +171,25 @@ Prometheus sets the `Host` header to `domain:port` as part of HTTP operations ag
 
 ### 6. Configure Grafana
 
-After Prometheus is configured, you can use Grafana to visualize MinIO metrics.
-Refer the [document here to setup Grafana with MinIO prometheus metrics](https://github.com/minio/minio/blob/master/docs/metrics/prometheus/grafana/README.md).
+After Prometheus is configured, you can use Grafana to visualize MinIO metrics. Refer the [document here to setup Grafana with MinIO prometheus metrics](https://github.com/minio/minio/blob/master/docs/metrics/prometheus/grafana/README.md).
 
 ## List of metrics exposed by MinIO
 
-MinIO server exposes the following metrics on `/minio/v2/metrics/cluster` endpoint. All of these can be accessed via Prometheus dashboard. A sample list of exposed metrics along with their definition is available in the demo server at
+- MinIO exports Prometheus compatible data by default as an authorized endpoint at `/minio/v2/metrics/cluster`. 
+- MinIO exports Prometheus compatible data by default which is bucket centric as an authorized endpoint at `/minio/v2/metrics/bucket`.
+- MinIO exports Prometheus compatible data by default which is node centric as an authorized endpoint at `/minio/v2/metrics/node`.
+- MinIO exports Prometheus compatible data by default which is resource centric as an authorized endpoint at `/minio/v2/metrics/resource`.
+
+All of these can be accessed via Prometheus dashboard. A sample list of exposed metrics along with their definition is available on our public demo server at
 
 ```sh
 curl https://play.min.io/minio/v2/metrics/cluster
 ```
 
-### List of metrics reported
+### List of metrics reported Cluster and Bucket level
 
 [The list of metrics reported can be here](https://github.com/minio/minio/blob/master/docs/metrics/prometheus/list.md)
+
+### Configure Alerts for Prometheus
+
+[The Prometheus AlertManager and alerts can be configured following this](https://github.com/minio/minio/blob/master/docs/metrics/prometheus/alerts.md)

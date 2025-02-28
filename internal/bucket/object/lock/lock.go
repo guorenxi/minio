@@ -18,19 +18,35 @@
 package lock
 
 import (
+	"bytes"
 	"context"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/textproto"
 	"strings"
 	"time"
 
 	"github.com/beevik/ntp"
+	"github.com/minio/minio/internal/amztime"
+	xhttp "github.com/minio/minio/internal/http"
+
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/env"
+	"github.com/minio/pkg/v3/env"
 )
+
+const (
+	logSubsys = "locking"
+)
+
+func lockLogIf(ctx context.Context, err error) {
+	logger.LogIf(ctx, logSubsys, err)
+}
+
+// Enabled indicates object locking is enabled
+const Enabled = "Enabled"
 
 // RetMode - object retention mode.
 type RetMode string
@@ -145,7 +161,7 @@ type Retention struct {
 func (r Retention) Retain(created time.Time) bool {
 	t, err := UTCNowNTP()
 	if err != nil {
-		logger.LogIf(context.Background(), err)
+		lockLogIf(context.Background(), err)
 		// Retain
 		return true
 	}
@@ -221,6 +237,30 @@ type Config struct {
 	} `xml:"Rule,omitempty"`
 }
 
+// String returns the human readable format of object lock configuration, used in audit logs.
+func (config Config) String() string {
+	parts := []string{
+		fmt.Sprintf("Enabled: %v", config.Enabled()),
+	}
+	if config.Rule != nil {
+		if config.Rule.DefaultRetention.Mode != "" {
+			parts = append(parts, fmt.Sprintf("Mode: %s", config.Rule.DefaultRetention.Mode))
+		}
+		if config.Rule.DefaultRetention.Days != nil {
+			parts = append(parts, fmt.Sprintf("Days: %d", *config.Rule.DefaultRetention.Days))
+		}
+		if config.Rule.DefaultRetention.Years != nil {
+			parts = append(parts, fmt.Sprintf("Years: %d", *config.Rule.DefaultRetention.Years))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+// Enabled returns true if config.ObjectLockEnabled is set to Enabled
+func (config *Config) Enabled() bool {
+	return config.ObjectLockEnabled == Enabled
+}
+
 // UnmarshalXML - decodes XML data.
 func (config *Config) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
 	// Make subtype to avoid recursive UnmarshalXML().
@@ -231,7 +271,7 @@ func (config *Config) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error
 		return err
 	}
 
-	if parsedConfig.ObjectLockEnabled != "Enabled" {
+	if parsedConfig.ObjectLockEnabled != Enabled {
 		return fmt.Errorf("only 'Enabled' value is allowed to ObjectLockEnabled element")
 	}
 
@@ -242,14 +282,14 @@ func (config *Config) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error
 // ToRetention - convert to Retention type.
 func (config *Config) ToRetention() Retention {
 	r := Retention{
-		LockEnabled: config.ObjectLockEnabled == "Enabled",
+		LockEnabled: config.ObjectLockEnabled == Enabled,
 	}
 	if config.Rule != nil {
 		r.Mode = config.Rule.DefaultRetention.Mode
 
 		t, err := UTCNowNTP()
 		if err != nil {
-			logger.LogIf(context.Background(), err)
+			lockLogIf(context.Background(), err)
 			// Do not change any configuration
 			// upon NTP failure.
 			return r
@@ -281,7 +321,7 @@ func ParseObjectLockConfig(reader io.Reader) (*Config, error) {
 // NewObjectLockConfig returns a initialized lock.Config struct
 func NewObjectLockConfig() *Config {
 	return &Config{
-		ObjectLockEnabled: "Enabled",
+		ObjectLockEnabled: Enabled,
 	}
 }
 
@@ -301,7 +341,7 @@ func (rDate *RetentionDate) UnmarshalXML(d *xml.Decoder, startElement xml.StartE
 	// While AWS documentation mentions that the date specified
 	// must be present in ISO 8601 format, in reality they allow
 	// users to provide RFC 3339 compliant dates.
-	retDate, err := time.Parse(time.RFC3339, dateStr)
+	retDate, err := amztime.ISO8601Parse(dateStr)
 	if err != nil {
 		return ErrInvalidRetentionDate
 	}
@@ -312,11 +352,11 @@ func (rDate *RetentionDate) UnmarshalXML(d *xml.Decoder, startElement xml.StartE
 
 // MarshalXML encodes expiration date if it is non-zero and encodes
 // empty string otherwise
-func (rDate *RetentionDate) MarshalXML(e *xml.Encoder, startElement xml.StartElement) error {
-	if *rDate == (RetentionDate{time.Time{}}) {
+func (rDate RetentionDate) MarshalXML(e *xml.Encoder, startElement xml.StartElement) error {
+	if rDate.IsZero() {
 		return nil
 	}
-	return e.EncodeElement(rDate.Format(time.RFC3339), startElement)
+	return e.EncodeElement(amztime.ISO8601Format(rDate.Time), startElement)
 }
 
 // ObjectRetention specified in
@@ -326,6 +366,10 @@ type ObjectRetention struct {
 	XMLName         xml.Name      `xml:"Retention"`
 	Mode            RetMode       `xml:"Mode,omitempty"`
 	RetainUntilDate RetentionDate `xml:"RetainUntilDate,omitempty"`
+}
+
+func (o ObjectRetention) String() string {
+	return fmt.Sprintf("Mode: %s, RetainUntilDate: %s", o.Mode, o.RetainUntilDate.Time)
 }
 
 // Maximum 4KiB size per object retention config.
@@ -351,7 +395,7 @@ func ParseObjectRetention(reader io.Reader) (*ObjectRetention, error) {
 
 	t, err := UTCNowNTP()
 	if err != nil {
-		logger.LogIf(context.Background(), err)
+		lockLogIf(context.Background(), err)
 		return &ret, ErrPastObjectLockRetainDate
 	}
 
@@ -406,18 +450,19 @@ func ParseObjectLockRetentionHeaders(h http.Header) (rmode RetMode, r RetentionD
 	// While AWS documentation mentions that the date specified
 	// must be present in ISO 8601 format, in reality they allow
 	// users to provide RFC 3339 compliant dates.
-	retDate, err = time.Parse(time.RFC3339, dateStr)
+	retDate, err = amztime.ISO8601Parse(dateStr)
 	if err != nil {
 		return rmode, r, ErrInvalidRetentionDate
 	}
+	_, replReq := h[textproto.CanonicalMIMEHeaderKey(xhttp.MinIOSourceReplicationRequest)]
 
 	t, err := UTCNowNTP()
 	if err != nil {
-		logger.LogIf(context.Background(), err)
+		lockLogIf(context.Background(), err)
 		return rmode, r, ErrPastObjectLockRetainDate
 	}
 
-	if retDate.Before(t) {
+	if retDate.Before(t) && !replReq {
 		return rmode, r, ErrPastObjectLockRetainDate
 	}
 
@@ -447,7 +492,7 @@ func GetObjectRetentionMeta(meta map[string]string) ObjectRetention {
 		tillStr, ok = meta[AmzObjectLockRetainUntilDate]
 	}
 	if ok {
-		if t, e := time.Parse(time.RFC3339, tillStr); e == nil {
+		if t, e := amztime.ISO8601Parse(tillStr); e == nil {
 			retainTill = RetentionDate{t.UTC()}
 		}
 	}
@@ -505,8 +550,7 @@ func (l *ObjectLegalHold) UnmarshalXML(d *xml.Decoder, start xml.StartElement) (
 			return err
 		}
 
-		switch se := t.(type) {
-		case xml.StartElement:
+		if se, ok := t.(xml.StartElement); ok {
 			switch se.Name.Local {
 			case "Status":
 				var st LegalHoldStatus
@@ -529,8 +573,13 @@ func (l *ObjectLegalHold) IsEmpty() bool {
 
 // ParseObjectLegalHold decodes the XML into ObjectLegalHold
 func ParseObjectLegalHold(reader io.Reader) (hold *ObjectLegalHold, err error) {
+	buf, err := io.ReadAll(io.LimitReader(reader, maxObjectLockConfigSize))
+	if err != nil {
+		return nil, err
+	}
+
 	hold = &ObjectLegalHold{}
-	if err = xml.NewDecoder(reader).Decode(hold); err != nil {
+	if err = xml.NewDecoder(bytes.NewReader(buf)).Decode(hold); err != nil {
 		return nil, err
 	}
 
@@ -546,6 +595,7 @@ func FilterObjectLockMetadata(metadata map[string]string, filterRetention, filte
 	dst := metadata
 	var copied bool
 	delKey := func(key string) {
+		key = strings.ToLower(key)
 		if _, ok := metadata[key]; !ok {
 			return
 		}

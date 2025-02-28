@@ -25,6 +25,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/minio/minio/internal/bpool"
 )
 
 const defaultFlushInterval = time.Duration(100) * time.Millisecond
@@ -50,6 +52,37 @@ func NewForwarder(f *Forwarder) *Forwarder {
 	return f
 }
 
+type bufPool struct {
+	sz   int
+	pool bpool.Pool[*[]byte]
+}
+
+func (b *bufPool) Put(buf []byte) {
+	if cap(buf) < b.sz || cap(buf) > b.sz*2 {
+		// Buffer too small or will likely leak memory after being expanded.
+		// Drop it.
+		return
+	}
+	b.pool.Put(&buf)
+}
+
+func (b *bufPool) Get() []byte {
+	bufp := b.pool.Get()
+	if bufp == nil || cap(*bufp) < b.sz {
+		return make([]byte, 0, b.sz)
+	}
+	return (*bufp)[:b.sz]
+}
+
+func newBufPool(sz int) httputil.BufferPool {
+	return &bufPool{sz: sz, pool: bpool.Pool[*[]byte]{
+		New: func() *[]byte {
+			buf := make([]byte, sz)
+			return &buf
+		},
+	}}
+}
+
 // ServeHTTP forwards HTTP traffic using the configured transport
 func (f *Forwarder) ServeHTTP(w http.ResponseWriter, inReq *http.Request) {
 	outReq := new(http.Request)
@@ -59,6 +92,7 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, inReq *http.Request) {
 		Director: func(req *http.Request) {
 			f.modifyRequest(req, inReq.URL)
 		},
+		BufferPool:    newBufPool(128 << 10),
 		Transport:     f.RoundTripper,
 		FlushInterval: defaultFlushInterval,
 		ErrorHandler:  f.customErrHandler,
@@ -72,7 +106,8 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, inReq *http.Request) {
 }
 
 // customErrHandler is originally implemented to avoid having the following error
-//    `http: proxy error: context canceled` printed by Golang
+//
+//	`http: proxy error: context canceled` printed by Golang
 func (f *Forwarder) customErrHandler(w http.ResponseWriter, r *http.Request, err error) {
 	if f.Logger != nil && err != context.Canceled {
 		f.Logger(err)

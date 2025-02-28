@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -21,16 +21,26 @@ import "github.com/minio/minio/internal/config"
 
 // Help template for storageclass feature.
 var (
+	defaultHelpPostfix = func(key string) string {
+		return config.DefaultHelpPostfix(DefaultKVS, key)
+	}
+
 	Help = config.HelpKVS{
 		config.HelpKV{
 			Key:         ClassStandard,
-			Description: `set the parity count for default standard storage class e.g. "EC:4"`,
+			Description: `set the parity count for default standard storage class` + defaultHelpPostfix(ClassStandard),
 			Optional:    true,
 			Type:        "string",
 		},
 		config.HelpKV{
 			Key:         ClassRRS,
-			Description: `set the parity count for reduced redundancy storage class e.g. "EC:2"`,
+			Description: `set the parity count for reduced redundancy storage class` + defaultHelpPostfix(ClassRRS),
+			Optional:    true,
+			Type:        "string",
+		},
+		config.HelpKV{
+			Key:         Optimize,
+			Description: `optimize parity calculation for standard storage class, set 'capacity' for capacity optimized (no additional parity)` + defaultHelpPostfix(Optimize),
 			Optional:    true,
 			Type:        "string",
 		},

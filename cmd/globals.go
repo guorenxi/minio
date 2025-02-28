@@ -23,35 +23,41 @@ import (
 	"net/http"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/minio/console/restapi"
+	consoleapi "github.com/minio/console/api"
+	"github.com/minio/dnscache"
+	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/set"
+	"github.com/minio/minio/internal/bpool"
 	"github.com/minio/minio/internal/bucket/bandwidth"
 	"github.com/minio/minio/internal/config"
+	"github.com/minio/minio/internal/config/browser"
+	"github.com/minio/minio/internal/grid"
 	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/kms"
-	"github.com/rs/dnscache"
+	"go.uber.org/atomic"
 
 	"github.com/dustin/go-humanize"
 	"github.com/minio/minio/internal/auth"
-	"github.com/minio/minio/internal/config/cache"
+	"github.com/minio/minio/internal/config/callhome"
 	"github.com/minio/minio/internal/config/compress"
 	"github.com/minio/minio/internal/config/dns"
-	xldap "github.com/minio/minio/internal/config/identity/ldap"
-	"github.com/minio/minio/internal/config/identity/openid"
-	xtls "github.com/minio/minio/internal/config/identity/tls"
-	"github.com/minio/minio/internal/config/policy/opa"
+	"github.com/minio/minio/internal/config/drive"
+	idplugin "github.com/minio/minio/internal/config/identity/plugin"
+	polplugin "github.com/minio/minio/internal/config/policy/plugin"
 	"github.com/minio/minio/internal/config/storageclass"
 	"github.com/minio/minio/internal/config/subnet"
 	xhttp "github.com/minio/minio/internal/http"
 	etcd "go.etcd.io/etcd/client/v3"
 
+	levent "github.com/minio/minio/internal/config/lambda/event"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/pubsub"
-	"github.com/minio/pkg/certs"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/pkg/v3/certs"
+	"github.com/minio/pkg/v3/env"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 // minio configuration related constants.
@@ -73,9 +79,9 @@ const (
 	globalWindowsOSName            = "windows"
 	globalMacOSName                = "darwin"
 	globalMinioModeFS              = "mode-server-fs"
+	globalMinioModeErasureSD       = "mode-server-xl-single"
 	globalMinioModeErasure         = "mode-server-xl"
 	globalMinioModeDistErasure     = "mode-server-distributed-xl"
-	globalMinioModeGatewayPrefix   = "mode-gateway-"
 	globalDirSuffix                = "__XLDIR__"
 	globalDirSuffixWithSlash       = globalDirSuffix + slashSeparator
 
@@ -86,9 +92,6 @@ const (
 	// Limit fields size (except file) to 1Mib since Policy document
 	// can reach that size according to https://aws.amazon.com/articles/1434
 	maxFormFieldSize = int64(1 * humanize.MiByte)
-
-	// Limit memory allocation to store multipart data
-	maxFormMemory = int64(5 * humanize.MiByte)
 
 	// The maximum allowed time difference between the incoming request
 	// date and server date during signature verification.
@@ -102,7 +105,7 @@ const (
 	GlobalStaleUploadsCleanupInterval = time.Hour * 6 // 6 hrs.
 
 	// Refresh interval to update in-memory iam config cache.
-	globalRefreshIAMInterval = 5 * time.Minute
+	globalRefreshIAMInterval = 10 * time.Minute
 
 	// Limit of location constraint XML for unauthenticated PUT bucket operations.
 	maxLocationConstraintSize = 3 * humanize.MiByte
@@ -112,6 +115,10 @@ const (
 
 	// diskFillFraction is the fraction of a disk we allow to be filled.
 	diskFillFraction = 0.99
+
+	// diskReserveFraction is the fraction of a disk where we will fill other server pools first.
+	// If all pools reach this, we will use all pools with regular placement.
+	diskReserveFraction = 0.15
 
 	// diskAssumeUnknownSize is the size to assume when an unknown size upload is requested.
 	diskAssumeUnknownSize = 1 << 30
@@ -123,24 +130,63 @@ const (
 	tlsClientSessionCacheSize = 100
 )
 
-var globalCLIContext = struct {
-	JSON, Quiet    bool
-	Anonymous      bool
-	StrictS3Compat bool
-}{}
+func init() {
+	// Injected to prevent circular dependency.
+	pubsub.GetByteBuffer = grid.GetByteBuffer
+}
+
+type poolDisksLayout struct {
+	cmdline string
+	layout  [][]string
+}
+
+type disksLayout struct {
+	legacy bool
+	pools  []poolDisksLayout
+}
+
+type serverCtxt struct {
+	JSON, Quiet               bool
+	Anonymous                 bool
+	StrictS3Compat            bool
+	Addr, ConsoleAddr         string
+	ConfigDir, CertsDir       string
+	configDirSet, certsDirSet bool
+	Interface                 string
+
+	RootUser, RootPwd string
+
+	FTP  []string
+	SFTP []string
+
+	MemLimit uint64
+
+	UserTimeout         time.Duration
+	IdleTimeout         time.Duration
+	ReadHeaderTimeout   time.Duration
+	MaxIdleConnsPerHost int
+
+	SendBufSize, RecvBufSize int
+	CrossDomainXML           string
+	// The layout of disks as interpreted
+	Layout disksLayout
+}
 
 var (
+	// Global user opts context
+	globalServerCtxt serverCtxt
+
 	// Indicates if the running minio server is distributed setup.
 	globalIsDistErasure = false
 
 	// Indicates if the running minio server is an erasure-code backend.
 	globalIsErasure = false
 
-	// Indicates if the running minio is in gateway mode.
-	globalIsGateway = false
+	// Indicates if the running minio server is in single drive XL mode.
+	globalIsErasureSD = false
 
-	// Name of gateway server, e.g S3, GCS, Azure, etc
-	globalGatewayName = ""
+	// Indicates if server code should go through testing path.
+	globalIsTesting = false
 
 	// This flag is set to 'true' by default
 	globalBrowserEnabled = true
@@ -149,20 +195,24 @@ var (
 	// and it is automatically deduced.
 	globalBrowserRedirectURL *xnet.URL
 
+	// Disable redirect, default is enabled.
+	globalBrowserRedirect bool
+
+	// globalBrowserConfig Browser user configurable settings
+	globalBrowserConfig browser.Config
+
 	// This flag is set to 'true' when MINIO_UPDATE env is set to 'off'. Default is false.
 	globalInplaceUpdateDisabled = false
 
-	globalSite = config.Site{
-		Region: globalMinioDefaultRegion,
-	}
+	// Captures site name and region
+	globalSite config.Site
 
 	// MinIO local server address (in `host:port` format)
 	globalMinioAddr = ""
 
 	// MinIO default port, can be changed through command line.
-	globalMinioPort            = GlobalMinioDefaultPort
-	globalMinioConsolePort     = "13333"
-	globalMinioConsolePortAuto = false
+	globalMinioPort        = GlobalMinioDefaultPort
+	globalMinioConsolePort = "13333"
 
 	// Holds the host that was passed using --address
 	globalMinioHost = ""
@@ -170,32 +220,34 @@ var (
 	globalMinioConsoleHost = ""
 
 	// Holds the possible host endpoint.
-	globalMinioEndpoint = ""
+	globalMinioEndpoint    = ""
+	globalMinioEndpointURL *xnet.URL
 
 	// globalConfigSys server config system.
 	globalConfigSys *ConfigSys
 
-	globalNotificationSys  *NotificationSys
-	globalConfigTargetList *event.TargetList
-	// globalEnvTargetList has list of targets configured via env.
-	globalEnvTargetList *event.TargetList
+	globalNotificationSys *NotificationSys
+
+	globalEventNotifier    *EventNotifier
+	globalNotifyTargetList *event.TargetList
+	globalLambdaTargetList *levent.TargetList
 
 	globalBucketMetadataSys *BucketMetadataSys
 	globalBucketMonitor     *bandwidth.Monitor
 	globalPolicySys         *PolicySys
 	globalIAMSys            *IAMSys
+	globalBytePoolCap       atomic.Pointer[bpool.BytePoolCap]
 
 	globalLifecycleSys       *LifecycleSys
 	globalBucketSSEConfigSys *BucketSSEConfigSys
 	globalBucketTargetSys    *BucketTargetSys
 	// globalAPIConfig controls S3 API requests throttling,
-	// healthcheck readiness deadlines and cors settings.
-	globalAPIConfig = apiConfig{listQuorum: 3}
+	// healthCheck readiness deadlines and cors settings.
+	globalAPIConfig = apiConfig{listQuorum: "strict", rootAccess: true}
 
 	globalStorageClass storageclass.Config
-	globalLDAPConfig   xldap.Config
-	globalOpenIDConfig openid.Config
-	globalSTSTLSConfig xtls.Config
+
+	globalAuthNPlugin *idplugin.AuthNPlugin
 
 	// CA root certificates, a nil value means system certs pool will be used
 	globalRootCAs *x509.CertPool
@@ -206,40 +258,59 @@ var (
 	globalTLSCerts *certs.Manager
 
 	globalHTTPServer        *xhttp.Server
+	globalTCPOptions        xhttp.TCPOptions
 	globalHTTPServerErrorCh = make(chan error)
 	globalOSSignalCh        = make(chan os.Signal, 1)
 
 	// global Trace system to send HTTP request/response
 	// and Storage/OS calls info to registered listeners.
-	globalTrace = pubsub.New()
+	globalTrace = pubsub.New[madmin.TraceInfo, madmin.TraceType](8)
 
 	// global Listen system to send S3 API events to registered listeners
-	globalHTTPListen = pubsub.New()
+	globalHTTPListen = pubsub.New[event.Event, pubsub.Mask](0)
 
 	// global console system to send console logs to
 	// registered listeners
 	globalConsoleSys *HTTPConsoleLoggerSys
 
+	// All unique drives for this deployment
 	globalEndpoints EndpointServerPools
+	// All unique nodes for this deployment
+	globalNodes []Node
 
 	// The name of this local node, fetched from arguments
-	globalLocalNodeName string
+	globalLocalNodeName    string
+	globalLocalNodeNameHex string
+	globalNodeNamesHex     = make(map[string]struct{})
 
 	// The global subnet config
 	globalSubnetConfig subnet.Config
 
-	globalRemoteEndpoints map[string]Endpoint
+	// The global callhome config
+	globalCallhomeConfig callhome.Config
+
+	// The global drive config
+	globalDriveConfig drive.Config
 
 	// Global server's network statistics
 	globalConnStats = newConnStats()
 
-	// Global HTTP request statisitics
+	// Global HTTP request statistics
 	globalHTTPStats = newHTTPStats()
+
+	// Global bucket network and API statistics
+	globalBucketConnStats = newBucketConnStats()
+	globalBucketHTTPStats = newBucketHTTPStats()
 
 	// Time when the server is started
 	globalBootTime = UTCNow()
 
-	globalActiveCred auth.Credentials
+	globalActiveCred         auth.Credentials
+	globalNodeAuthToken      string
+	globalSiteReplicatorCred siteReplicatorCred
+
+	// Captures if root credentials are set via ENV.
+	globalCredViaEnv bool
 
 	globalPublicCerts []*x509.Certificate
 
@@ -253,17 +324,14 @@ var (
 	globalBucketQuotaSys      *BucketQuotaSys
 	globalBucketVersioningSys *BucketVersioningSys
 
-	// Disk cache drives
-	globalCacheConfig cache.Config
-
-	// Initialized KMS configuration for disk cache
-	globalCacheKMS kms.KMS
-
 	// Allocated etcd endpoint for config and bucket DNS.
 	globalEtcdClient *etcd.Client
 
 	// Cluster replication manager.
 	globalSiteReplicationSys SiteReplicationSys
+
+	// Cluster replication resync metrics
+	globalSiteResyncMetrics *siteResyncMetrics
 
 	// Is set to true when Bucket federation is requested
 	// and is 'true' when etcdConfig.PathPrefix is empty
@@ -273,7 +341,10 @@ var (
 	globalDNSConfig dns.Store
 
 	// GlobalKMS initialized KMS configuration
-	GlobalKMS kms.KMS
+	GlobalKMS *kms.KMS
+
+	// Common lock for various subsystems performing the leader tasks
+	globalLeaderLock *sharedLock
 
 	// Auto-Encryption, if enabled, turns any non-SSE-C request
 	// into an SSE-S3 request. If enabled a valid, non-empty KMS
@@ -290,25 +361,26 @@ var (
 	// Some standard content-types which we strictly dis-allow for compression.
 	standardExcludeCompressContentTypes = []string{"video/*", "audio/*", "application/zip", "application/x-gzip", "application/x-zip-compressed", " application/x-compress", "application/x-spoon"}
 
-	// Authorization validators list.
-	globalOpenIDValidators *openid.Validators
-
-	// OPA policy system.
-	globalPolicyOPA *opa.Opa
+	// AuthZ Plugin system.
+	globalAuthZPlugin *polplugin.AuthZPlugin
 
 	// Deployment ID - unique per deployment
-	globalDeploymentID string
+	globalDeploymentIDPtr atomic.Pointer[string]
+	globalDeploymentID    = func() string {
+		ptr := globalDeploymentIDPtr.Load()
+		if ptr == nil {
+			return ""
+		}
+		return *ptr
+	}
 
-	// GlobalGatewaySSE sse options
-	GlobalGatewaySSE gatewaySSE
-
-	globalAllHealState *allHealState
+	globalAllHealState = newHealState(GlobalContext, true)
 
 	// The always present healing routine ready to heal objects
-	globalBackgroundHealRoutine *healRoutine
-	globalBackgroundHealState   *allHealState
+	globalBackgroundHealRoutine = newHealRoutine()
+	globalBackgroundHealState   = newHealState(GlobalContext, false)
 
-	globalMRFState mrfState
+	globalMRFState = newMRFState()
 
 	// If writes to FS backend should be O_SYNC.
 	globalFSOSync bool
@@ -317,7 +389,7 @@ var (
 
 	globalInternodeTransport http.RoundTripper
 
-	globalProxyTransport http.RoundTripper
+	globalRemoteTargetTransport http.RoundTripper
 
 	globalDNSCache = &dnscache.Resolver{
 		Timeout: 5 * time.Second,
@@ -327,9 +399,7 @@ var (
 
 	globalTierConfigMgr *TierConfigMgr
 
-	globalTierJournal *tierJournal
-
-	globalConsoleSrv *restapi.Server
+	globalConsoleSrv *consoleapi.Server
 
 	// handles service freeze or un-freeze S3 API calls.
 	globalServiceFreeze atomic.Value
@@ -338,14 +408,84 @@ var (
 	globalServiceFreezeCnt int32
 	globalServiceFreezeMu  sync.Mutex // Updates.
 
-	// List of local drives to this node, this is only set during server startup.
-	globalLocalDrives []StorageAPI
+	// Map of local drives to this node, this is set during server startup,
+	// disk reconnect and mutated by HealFormat. Hold globalLocalDrivesMu to access.
+	globalLocalDrivesMap map[string]StorageAPI
+	globalLocalDrivesMu  sync.RWMutex
+
+	globalDriveMonitoring = env.Get("_MINIO_DRIVE_ACTIVE_MONITORING", config.EnableOn) == config.EnableOn
 
 	// Is MINIO_CI_CD set?
 	globalIsCICD bool
 
 	globalRootDiskThreshold uint64
+
+	// Used for collecting stats for netperf
+	globalNetPerfMinDuration     = time.Second * 10
+	globalNetPerfRX              netPerfRX
+	globalSiteNetPerfRX          netPerfRX
+	globalObjectPerfBucket       = "minio-perf-test-tmp-bucket"
+	globalObjectPerfUserMetadata = "X-Amz-Meta-Minio-Object-Perf" // Clients can set this to bypass S3 API service freeze. Used by object pref tests.
+
+	// MinIO version unix timestamp
+	globalVersionUnix uint64
+
+	// MinIO client
+	globalMinioClient *minio.Client
+
+	// Public key for subnet confidential information
+	subnetAdminPublicKey    = []byte("-----BEGIN PUBLIC KEY-----\nMIIBCgKCAQEAyC+ol5v0FP+QcsR6d1KypR/063FInmNEFsFzbEwlHQyEQN3O7kNI\nwVDN1vqp1wDmJYmv4VZGRGzfFw1q+QV7K1TnysrEjrqpVxfxzDQCoUadAp8IxLLc\ns2fjyDNxnZjoC6fTID9C0khKnEa5fPZZc3Ihci9SiCGkPmyUyCGVSxWXIKqL2Lrj\nyDc0pGeEhWeEPqw6q8X2jvTC246tlzqpDeNsPbcv2KblXRcKniQNbBrizT37CKHQ\nM6hc9kugrZbFuo8U5/4RQvZPJnx/DVjLDyoKo2uzuVQs4s+iBrA5sSSLp8rPED/3\n6DgWw3e244Dxtrg972dIT1IOqgn7KUJzVQIDAQAB\n-----END PUBLIC KEY-----")
+	subnetAdminPublicKeyDev = []byte("-----BEGIN PUBLIC KEY-----\nMIIBCgKCAQEArhQYXQd6zI4uagtVfthAPOt6i4AYHnEWCoNeAovM4MNl42I9uQFh\n3VHkbWj9Gpx9ghf6PgRgK+8FcFvy+StmGcXpDCiFywXX24uNhcZjscX1C4Esk0BW\nidfI2eXYkOlymD4lcK70SVgJvC693Qa7Z3FE1KU8Nfv2bkxEE4bzOkojX9t6a3+J\nR8X6Z2U8EMlH1qxJPgiPogELhWP0qf2Lq7GwSAflo1Tj/ytxvD12WrnE0Rrj/8yP\nSnp7TbYm91KocKMExlmvx3l2XPLxeU8nf9U0U+KOmorejD3MDMEPF+tlk9LB3JWP\nZqYYe38rfALVTn4RVJriUcNOoEpEyC0WEwIDAQAB\n-----END PUBLIC KEY-----")
+
+	// dynamic sleeper to avoid thundering herd for trash folder expunge routine
+	deleteCleanupSleeper = newDynamicSleeper(5, 25*time.Millisecond, false)
+
+	// dynamic sleeper for multipart expiration routine
+	deleteMultipartCleanupSleeper = newDynamicSleeper(5, 25*time.Millisecond, false)
+
+	// Is MINIO_SYNC_BOOT set?
+	globalEnableSyncBoot bool
+
+	// Contains NIC interface name used for internode communication
+	globalInternodeInterface     string
+	globalInternodeInterfaceOnce sync.Once
+
+	// Set last client perf extra time (get lock, and validate)
+	globalLastClientPerfExtraTime int64
+
+	// Captures all batch jobs metrics globally
+	globalBatchJobsMetrics batchJobMetrics
+
+	// Indicates if server was started as `--address ":0"`
+	globalDynamicAPIPort bool
+
 	// Add new variable global values here.
 )
+
+var globalAuthPluginMutex sync.Mutex
+
+func newGlobalAuthNPluginFn() *idplugin.AuthNPlugin {
+	globalAuthPluginMutex.Lock()
+	defer globalAuthPluginMutex.Unlock()
+	return globalAuthNPlugin
+}
+
+func newGlobalAuthZPluginFn() *polplugin.AuthZPlugin {
+	globalAuthPluginMutex.Lock()
+	defer globalAuthPluginMutex.Unlock()
+	return globalAuthZPlugin
+}
+
+func setGlobalAuthNPlugin(authn *idplugin.AuthNPlugin) {
+	globalAuthPluginMutex.Lock()
+	globalAuthNPlugin = authn
+	globalAuthPluginMutex.Unlock()
+}
+
+func setGlobalAuthZPlugin(authz *polplugin.AuthZPlugin) {
+	globalAuthPluginMutex.Lock()
+	globalAuthZPlugin = authz
+	globalAuthPluginMutex.Unlock()
+}
 
 var errSelfTestFailure = errors.New("self test failed. unsafe to start server")

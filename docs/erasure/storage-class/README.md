@@ -1,15 +1,15 @@
 # MinIO Storage Class Quickstart Guide [![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io)
 
-MinIO server supports storage class in erasure coding mode. This allows configurable data and parity disks per object.
+MinIO server supports storage class in erasure coding mode. This allows configurable data and parity drives per object.
 
-This page is intended as a summary of MinIO Erasure Coding. For a more complete explanation, see https://docs.min.io/minio/baremetal/concepts/erasure-coding.html. 
+This page is intended as a summary of MinIO Erasure Coding. For a more complete explanation, see <https://min.io/docs/minio/linux/operations/concepts/erasure-coding.html>.
 
 ## Overview
 
 MinIO supports two storage classes, Reduced Redundancy class and Standard class. These classes can be defined using environment variables
-set before starting MinIO server. After the data and parity disks for each storage class are defined using environment variables,
+set before starting MinIO server. After the data and parity drives for each storage class are defined using environment variables,
 you can set the storage class of an object via request metadata field `x-amz-storage-class`. MinIO server then honors the storage class by
-saving the object in specific number of data and parity disks.
+saving the object in specific number of data and parity drives.
 
 ## Storage usage
 
@@ -38,12 +38,12 @@ You can calculate _approximate_ storage usage ratio using the formula - total dr
 
 ### Allowed values for STANDARD storage class
 
-`STANDARD` storage class implies more parity than `REDUCED_REDUNDANCY` class. So, `STANDARD` parity disks should be
+`STANDARD` storage class implies more parity than `REDUCED_REDUNDANCY` class. So, `STANDARD` parity drives should be
 
 - Greater than or equal to 2, if `REDUCED_REDUNDANCY` parity is not set.
 - Greater than `REDUCED_REDUNDANCY` parity, if it is set.
 
-Parity blocks can not be higher than data blocks, so `STANDARD` storage class parity can not be higher than N/2. (N being total number of disks)
+Parity blocks can not be higher than data blocks, so `STANDARD` storage class parity can not be higher than N/2. (N being total number of drives)
 
 The default value for the `STANDARD` storage class depends on the number of volumes in the erasure set:
 
@@ -53,18 +53,16 @@ The default value for the `STANDARD` storage class depends on the number of volu
 | 6-7              |                 EC:3  |
 | 8 or more        |                 EC:4  |
 
-For more complete documentation on Erasure Set sizing, see the [MinIO Documentation on Erasure Sets](https://docs.min.io/minio/baremetal/concepts/erasure-coding.html#erasure-sets).
+For more complete documentation on Erasure Set sizing, see the [MinIO Documentation on Erasure Sets](https://min.io/docs/minio/linux/operations/concepts/erasure-coding.html#erasure-sets).
 
 ### Allowed values for REDUCED_REDUNDANCY storage class
 
-`REDUCED_REDUNDANCY` implies lesser parity than `STANDARD` class. So,`REDUCED_REDUNDANCY` parity disks should be
+`REDUCED_REDUNDANCY` implies lesser parity than `STANDARD` class. So,`REDUCED_REDUNDANCY` parity drives should be
 
 - Less than N/2, if `STANDARD` parity is not set.
 - Less than `STANDARD` Parity, if it is set.
 
-As parity below 2 is not recommended, `REDUCED_REDUNDANCY` storage class is not supported for 4 disks erasure coding setup.
-
-Default value for `REDUCED_REDUNDANCY` storage class is `2`.
+Default value for `REDUCED_REDUNDANCY` storage class is `1`.
 
 ## Get started with Storage Class
 
@@ -85,37 +83,37 @@ export MINIO_STORAGE_CLASS_RRS=EC:2
 Storage class can also be set via `mc admin config` get/set commands to update the configuration. Refer [storage class](https://github.com/minio/minio/tree/master/docs/config#storage-class) for
 more details.
 
-*Note*
+#### Note
 
 - If `STANDARD` storage class is set via environment variables or `mc admin config` get/set commands, and `x-amz-storage-class` is not present in request metadata, MinIO server will
-apply `STANDARD` storage class to the object. This means the data and parity disks will be used as set in `STANDARD` storage class.
+apply `STANDARD` storage class to the object. This means the data and parity drives will be used as set in `STANDARD` storage class.
 
 - If storage class is not defined before starting MinIO server, and subsequent PutObject metadata field has `x-amz-storage-class` present
 with values `REDUCED_REDUNDANCY` or `STANDARD`, MinIO server uses default parity values.
 
 ### Set metadata
 
-In below example `minio-go` is used to set the storage class to `REDUCED_REDUNDANCY`. This means this object will be split across 6 data disks and 2 parity disks (as per the storage class set in previous step).
+In below example `minio-go` is used to set the storage class to `REDUCED_REDUNDANCY`. This means this object will be split across 6 data drives and 2 parity drives (as per the storage class set in previous step).
 
 ```go
 s3Client, err := minio.New("localhost:9000", "YOUR-ACCESSKEYID", "YOUR-SECRETACCESSKEY", true)
 if err != nil {
-	log.Fatalln(err)
+ log.Fatalln(err)
 }
 
 object, err := os.Open("my-testfile")
 if err != nil {
-	log.Fatalln(err)
+ log.Fatalln(err)
 }
 defer object.Close()
 objectStat, err := object.Stat()
 if err != nil {
-	log.Fatalln(err)
+ log.Fatalln(err)
 }
 
 n, err := s3Client.PutObject("my-bucketname", "my-objectname", object, objectStat.Size(), minio.PutObjectOptions{ContentType: "application/octet-stream", StorageClass: "REDUCED_REDUNDANCY"})
 if err != nil {
-	log.Fatalln(err)
+ log.Fatalln(err)
 }
 log.Println("Uploaded", "my-objectname", " of size: ", n, "Successfully.")
 ```

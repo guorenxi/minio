@@ -25,8 +25,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bcicen/jstream"
 	csv "github.com/minio/csvparser"
+	"github.com/minio/minio/internal/s3select/jstream"
 	"github.com/minio/minio/internal/s3select/sql"
 )
 
@@ -59,6 +59,7 @@ func (r *Record) Get(name string) (*sql.Value, error) {
 			}
 			return sql.FromBytes([]byte(r.csvRecord[idx])), nil
 		}
+		// TODO: Return Missing?
 		return nil, fmt.Errorf("column %v not found", name)
 	}
 
@@ -124,9 +125,11 @@ func (r *Record) WriteCSV(writer io.Writer, opts sql.WriteCSVOpts) error {
 
 // WriteJSON - encodes to JSON data.
 func (r *Record) WriteJSON(writer io.Writer) error {
-	var kvs jstream.KVS = make([]jstream.KV, len(r.columnNames))
-	for i := 0; i < len(r.columnNames); i++ {
-		kvs[i] = jstream.KV{Key: r.columnNames[i], Value: r.csvRecord[i]}
+	var kvs jstream.KVS = make([]jstream.KV, 0, len(r.columnNames))
+	for i, cn := range r.columnNames {
+		if i < len(r.csvRecord) {
+			kvs = append(kvs, jstream.KV{Key: cn, Value: r.csvRecord[i]})
+		}
 	}
 	return json.NewEncoder(writer).Encode(kvs)
 }

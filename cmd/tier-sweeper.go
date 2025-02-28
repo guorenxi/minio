@@ -18,6 +18,8 @@
 package cmd
 
 import (
+	"context"
+
 	"github.com/minio/minio/internal/bucket/lifecycle"
 )
 
@@ -27,15 +29,17 @@ import (
 // // Perform a ObjectLayer.GetObjectInfo to fetch object version information
 // goiOpts := os.GetOpts()
 // gerr := objAPI.GetObjectInfo(ctx, bucket, object, goiOpts)
-// if gerr == nil {
-//    os.SetTransitionState(goi)
-// }
+//
+//	if gerr == nil {
+//	   os.SetTransitionState(goi)
+//	}
 //
 // // After the overwriting object operation is complete.
-// if jentry, ok := os.ShouldRemoveRemoteObject(); ok {
-//     err := globalTierJournal.AddEntry(jentry)
-//     logger.LogIf(ctx, err)
-// }
+//
+//	if jentry, ok := os.ShouldRemoveRemoteObject(); ok {
+//	    err := globalTierJournal.AddEntry(jentry)
+//	    logger.LogIf(ctx, err)
+//	}
 type objSweeper struct {
 	Object              string
 	Bucket              string
@@ -126,9 +130,22 @@ func (os *objSweeper) shouldRemoveRemoteObject() (jentry, bool) {
 }
 
 // Sweep removes the transitioned object if it's no longer referred to.
-func (os *objSweeper) Sweep() error {
+func (os *objSweeper) Sweep() {
 	if je, ok := os.shouldRemoveRemoteObject(); ok {
-		return globalTierJournal.AddEntry(je)
+		globalExpiryState.enqueueTierJournalEntry(je)
 	}
-	return nil
+}
+
+type jentry struct {
+	ObjName   string
+	VersionID string
+	TierName  string
+}
+
+func deleteObjectFromRemoteTier(ctx context.Context, objName, rvID, tierName string) error {
+	w, err := globalTierConfigMgr.getDriver(ctx, tierName)
+	if err != nil {
+		return err
+	}
+	return w.Remove(ctx, objName, remoteVersionID(rvID))
 }

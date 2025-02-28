@@ -18,33 +18,11 @@
 package cmd
 
 import (
+	"context"
 	"os"
 	"reflect"
-	"strings"
 	"testing"
-
-	"github.com/minio/madmin-go"
 )
-
-// Tests if we generate storage info.
-func TestStorageInfoMsg(t *testing.T) {
-	infoStorage := StorageInfo{}
-	infoStorage.Disks = []madmin.Disk{
-		{Endpoint: "http://127.0.0.1:9000/data/1/", State: madmin.DriveStateOk},
-		{Endpoint: "http://127.0.0.1:9000/data/2/", State: madmin.DriveStateOk},
-		{Endpoint: "http://127.0.0.1:9000/data/3/", State: madmin.DriveStateOk},
-		{Endpoint: "http://127.0.0.1:9000/data/4/", State: madmin.DriveStateOk},
-		{Endpoint: "http://127.0.0.1:9001/data/1/", State: madmin.DriveStateOk},
-		{Endpoint: "http://127.0.0.1:9001/data/2/", State: madmin.DriveStateOk},
-		{Endpoint: "http://127.0.0.1:9001/data/3/", State: madmin.DriveStateOk},
-		{Endpoint: "http://127.0.0.1:9001/data/4/", State: madmin.DriveStateOffline},
-	}
-	infoStorage.Backend.Type = madmin.Erasure
-
-	if msg := getStorageInfoMsg(infoStorage); !strings.Contains(msg, "7 Online, 1 Offline") {
-		t.Fatal("Unexpected storage info message, found:", msg)
-	}
-}
 
 // Tests stripping standard ports from apiEndpoints.
 func TestStripStandardPorts(t *testing.T) {
@@ -71,7 +49,10 @@ func TestStripStandardPorts(t *testing.T) {
 
 // Test printing server common message.
 func TestPrintServerCommonMessage(t *testing.T) {
-	obj, fsDir, err := prepareFS()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	obj, fsDir, err := prepareFS(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +67,10 @@ func TestPrintServerCommonMessage(t *testing.T) {
 
 // Tests print cli access message.
 func TestPrintCLIAccessMsg(t *testing.T) {
-	obj, fsDir, err := prepareFS()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	obj, fsDir, err := prepareFS(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +85,10 @@ func TestPrintCLIAccessMsg(t *testing.T) {
 
 // Test print startup message.
 func TestPrintStartupMessage(t *testing.T) {
-	obj, fsDir, err := prepareFS()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	obj, fsDir, err := prepareFS(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

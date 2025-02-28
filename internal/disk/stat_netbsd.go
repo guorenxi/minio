@@ -21,13 +21,14 @@
 package disk
 
 import (
+	"errors"
 	"fmt"
 
 	"golang.org/x/sys/unix"
 )
 
 // GetInfo returns total and free bytes available in a directory, e.g. `/`.
-func GetInfo(path string) (info Info, err error) {
+func GetInfo(path string, _ bool) (info Info, err error) {
 	s := unix.Statvfs_t{}
 	if err = unix.Statvfs(path, &s); err != nil {
 		return Info{}, err
@@ -41,8 +42,13 @@ func GetInfo(path string) (info Info, err error) {
 		FSType: string(s.Fstypename[:]),
 	}
 	if info.Free > info.Total {
-		return info, fmt.Errorf("detected free space (%d) > total disk space (%d), fs corruption at (%s). please run 'fsck'", info.Free, info.Total, path)
+		return info, fmt.Errorf("detected free space (%d) > total drive space (%d), fs corruption at (%s). please run 'fsck'", info.Free, info.Total, path)
 	}
 	info.Used = info.Total - info.Free
 	return info, nil
+}
+
+// GetDriveStats returns IO stats of the drive by its major:minor
+func GetDriveStats(major, minor uint32) (iostats IOStats, err error) {
+	return IOStats{}, errors.New("operation unsupported")
 }

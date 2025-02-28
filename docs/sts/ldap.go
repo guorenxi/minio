@@ -24,7 +24,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/url"
 	"os"
@@ -80,9 +80,9 @@ func main() {
 	if sessionPolicyFile != "" {
 		var policy string
 		if f, err := os.Open(sessionPolicyFile); err != nil {
-			log.Fatalf("Unable to open session policy file: %v", sessionPolicyFile, err)
+			log.Fatalf("Unable to open session policy file %s: %v", sessionPolicyFile, err)
 		} else {
-			bs, err := ioutil.ReadAll(f)
+			bs, err := io.ReadAll(f)
 			if err != nil {
 				log.Fatalf("Error reading session policy file: %v", err)
 			}
@@ -124,7 +124,7 @@ func main() {
 	// Use generated credentials to authenticate with MinIO server
 	minioClient, err := minio.New(stsEndpointURL.Host, opts)
 	if err != nil {
-		log.Fatalf("Error initializing client: ", err)
+		log.Fatalf("Error initializing client: %v", err)
 	}
 
 	// Use minIO Client object normally like the regular client.

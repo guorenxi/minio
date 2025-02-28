@@ -18,6 +18,7 @@
 package cmd
 
 import (
+	"context"
 	"os"
 	"reflect"
 	"sync"
@@ -27,8 +28,8 @@ import (
 )
 
 // Helper function to create a lock server for testing
-func createLockTestServer(t *testing.T) (string, *lockRESTServer, string) {
-	obj, fsDir, err := prepareFS()
+func createLockTestServer(ctx context.Context, t *testing.T) (string, *lockRESTServer, string) {
+	obj, fsDir, err := prepareFS(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +44,7 @@ func createLockTestServer(t *testing.T) (string, *lockRESTServer, string) {
 		},
 	}
 	creds := globalActiveCred
-	token, err := authenticateNode(creds.AccessKey, creds.SecretKey, "")
+	token, err := authenticateNode(creds.AccessKey, creds.SecretKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,22 +53,25 @@ func createLockTestServer(t *testing.T) (string, *lockRESTServer, string) {
 
 // Test function to remove lock entries from map based on name & uid combination
 func TestLockRpcServerRemoveEntry(t *testing.T) {
-	testPath, locker, _ := createLockTestServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	testPath, locker, _ := createLockTestServer(ctx, t)
 	defer os.RemoveAll(testPath)
 
 	lockRequesterInfo1 := lockRequesterInfo{
 		Owner:           "owner",
 		Writer:          true,
 		UID:             "0123-4567",
-		Timestamp:       UTCNow(),
-		TimeLastRefresh: UTCNow(),
+		Timestamp:       UTCNow().UnixNano(),
+		TimeLastRefresh: UTCNow().UnixNano(),
 	}
 	lockRequesterInfo2 := lockRequesterInfo{
 		Owner:           "owner",
 		Writer:          true,
 		UID:             "89ab-cdef",
-		Timestamp:       UTCNow(),
-		TimeLastRefresh: UTCNow(),
+		Timestamp:       UTCNow().UnixNano(),
+		TimeLastRefresh: UTCNow().UnixNano(),
 	}
 
 	locker.ll.lockMap["name"] = []lockRequesterInfo{
